@@ -1,5 +1,6 @@
 package oot.be;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -212,6 +213,56 @@ public class BEParser {
      */
     public BEValue parse(ByteBuffer buffer) throws IllegalArgumentException, BufferUnderflowException {
         return parseElement(buffer);
+    }
+
+
+    /**
+     * Serializes given value into byte array
+     * @param value value to serialize
+     * @return not null array
+     */
+    public byte[] encode(BEValue value) {
+        ByteArrayOutputStream os = new ByteArrayOutputStream();
+        encodeElement(os, value);
+        return os.toByteArray();
+    }
+
+    /**
+     * Serializes given value into the specified stream
+     * @param os stream to serialize into
+     * @param value value to serialize
+     */
+    private void encodeElement(ByteArrayOutputStream os, BEValue value) {
+
+        if (value.type == BEValue.BEValueType.INT) {
+            os.write((byte)'i');
+            os.writeBytes(Long.toString(value.integer).getBytes(StandardCharsets.UTF_8));
+            os.write((byte)'e');
+        }
+        else if (value.type == BEValue.BEValueType.BSTR) {
+            os.writeBytes(Integer.toString(value.bString.length).getBytes(StandardCharsets.UTF_8));
+            os.write((byte)':');
+            os.writeBytes(value.bString);
+        }
+        else if (value.type == BEValue.BEValueType.DICT) {
+            os.write((byte)'d');
+            value.dictionary.forEach((k, v) -> {
+                os.writeBytes(Integer.toString(k.length()).getBytes(StandardCharsets.UTF_8));
+                os.write((byte)':');
+                os.writeBytes(k.getBytes(StandardCharsets.UTF_8));
+                System.out.println("d: " + k);
+                encodeElement(os, v);
+            });
+            os.write((byte)'e');
+        }
+        else if (value.type == BEValue.BEValueType.LIST) {
+            os.write((byte)'l');
+            value.list.forEach(v -> encodeElement(os, v));
+            os.write((byte)'e');
+        } else {
+            // buffer with incorrect data
+            throw new IllegalArgumentException("");
+        }
     }
 
 }
