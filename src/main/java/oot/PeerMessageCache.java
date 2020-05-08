@@ -20,8 +20,15 @@ public class PeerMessageCache {
      */
     private final ArrayDeque<PeerMessage> cache = new ArrayDeque<>(CACHE_SIZE);
 
+    /**
+     * debug counter
+     */
     public static int counter = 0;
 
+    /**
+     * @param type {@link PeerMessage#type}
+     * @return instance of typed peer message to be used
+     */
     private PeerMessage getInstance(byte type) {
         PeerMessage pm;
         synchronized (cache) {
@@ -35,9 +42,14 @@ public class PeerMessageCache {
         return pm;
     }
 
+    /**
+     * returns peer message to cache for future use
+     * @param pm message to return
+     */
     public void release(PeerMessage pm)
     {
-        assert cache.contains(pm) : "the same instance release twice";
+        assert cache.contains(pm) : "the same instance released twice";
+
         pm.block = null;
         pm.pieces = null;
         synchronized (cache) {
@@ -47,16 +59,24 @@ public class PeerMessageCache {
         }
     }
 
+    /*
+     * next methods simply work as a facade and
+     * return messages of appropriate type
+     */
+
 
     public PeerMessage choke() {
         return getInstance(PeerMessage.CHOKE);
     }
+
     public PeerMessage unchoke() {
         return getInstance(PeerMessage.UNCHOKE);
     }
+
     public PeerMessage interested() {
         return getInstance(PeerMessage.INTERESTED);
     }
+
     public PeerMessage notInterested() {
         return getInstance(PeerMessage.NOT_INTERESTED);
     }
@@ -92,9 +112,10 @@ public class PeerMessageCache {
         return pm;
     }
 
-    public PeerMessage bitfield(BitSet pieces) {
+    public PeerMessage bitfield(int pieces, BitSet state) {
         PeerMessage pm = getInstance(PeerMessage.BITFIELD);
-        pm.pieces = pieces;
+        pm.index = pieces;
+        pm.pieces = state;
         return pm;
     }
 
@@ -102,5 +123,9 @@ public class PeerMessageCache {
         PeerMessage pm = getInstance(PeerMessage.PORT);
         pm.index = port;
         return pm;
+    }
+
+    public PeerMessage keepalive() {
+        return getInstance(PeerMessage.KEEPALIVE);
     }
 }

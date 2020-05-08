@@ -1,17 +1,17 @@
 package oot;
 
+import oot.be.BEValue;
 import oot.be.Metainfo;
 
 
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Paths;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
+import java.nio.file.*;
 
 import java.util.ArrayDeque;
+import java.util.BitSet;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Consumer;
@@ -105,6 +105,15 @@ public class SimpleFileStorage extends Storage {
             }
         }
 
+        @Override
+        public void writeState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
+            SimpleFileStorage.this.writeState(metainfo, pieces, active);
+        }
+
+        @Override
+        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
+            SimpleFileStorage.this.readState(metainfo, pieces, active);
+        }
     }
 
     /**
@@ -412,4 +421,58 @@ public class SimpleFileStorage extends Storage {
 
         return true;
     }
+
+    /**
+     * TODO: remove OOS
+     * @param metainfo
+     * @param pieces
+     * @param active
+     */
+    private void writeState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
+        try {
+            Path state = root.resolve("state");
+            Path path = state.resolve(metainfo.getInfohash().toString());
+
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            ObjectOutputStream os = new ObjectOutputStream(bos);
+            os.writeObject(pieces);
+            os.writeObject(active);
+            os.flush();
+
+            if (!Files.exists(state)) {
+                Files.createDirectory(state);
+            }
+            Files.write(path, bos.toByteArray());
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void readState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
+        try {
+            Path path = root.resolve("state/" + metainfo.getInfohash().toString());
+            if (!Files.exists(path)) {
+                return;
+            }
+
+            byte[] data = Files.readAllBytes(path);
+
+            ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+
+            BitSet rPieces = (BitSet) ois.readObject();
+            pieces.clear();
+            pieces.or(rPieces);
+
+            Map<Integer, Torrent.PieceBlocks> rActive = (Map<Integer, Torrent.PieceBlocks>) ois.readObject();
+            active.clear();
+            rActive.forEach((p, b) -> {
+                b.active.clear();
+                active.put(p, b);
+            });
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
 }

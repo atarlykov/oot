@@ -1,9 +1,9 @@
 package oot;
 
-public class PeerStatistics {
-
-    public static final int PERIODS = 20;
-    public static final int PERIOD = 1000;
+/**
+ * collects various statistics for a bound peer connection
+ */
+public class PeerConnectionStatistics {
 
     /**
      * collects incremental statistics
@@ -60,11 +60,22 @@ public class PeerStatistics {
         }
 
         /**
+         * allocates new cells to make the head contain current time slot
+         */
+        private void grow() {
+            long timestamp = System.currentTimeMillis();
+            long p = timestamp / period;
+            if (timeHead < p) {
+                grow(p - timeHead);
+            }
+        }
+
+        /**
          * allocates new cells to allow more periods in the history
          * @param periods number of cells to add
          */
-        private void grow(long periods) {
-
+        private void grow(long periods)
+        {
             if (data.length < periods) {
                 // clear all history,
                 // set size = 1 (tail == head)
@@ -99,15 +110,19 @@ public class PeerStatistics {
         }
 
         /**
-         * just primitive implementation
-         * @param periods number of periods to avarage
+         * just primitive implementation, doesn't check for overflow,
+         * return average value for the last completed periods
+         * @param periods number of periods to average
          * @return floored average value
          */
-        public long average(int periods) {
-            int i = head;
+        public long average(int periods)
+        {
+            // make sure we have correct head pointer
+            grow();
 
-            long sum = data[head];
-            int count = 1;
+            int i = head;
+            long sum = 0;
+            int count = 0;
             while ((i != tail) && (count < periods)) {
                 i -= 1;
                 if (i < 0) {
@@ -116,50 +131,64 @@ public class PeerStatistics {
                 sum += data[i];
                 count += 1;
             }
-            return sum / count;
+            return (count != 0) ? sum / count : 0;
         }
 
-        public long average() {
-            return average(PERIODS);
+        /**
+         * @return value from the current (growing) cell
+         * of history records, value could grow over time
+         * till the end of the current period
+         */
+        public long last() {
+            grow();
+            return data[head];
         }
     }
 
+    /**
+     * download speed history
+     */
+    Statistics download;
+    /**
+     * upload speed history
+     */
+    Statistics upload;
 
-    Statistics download = new Statistics(PERIODS, PERIOD);
-    Statistics upload = new Statistics(PERIODS, PERIOD);
+    /**
+     * number of blocks received with the connection
+     */
+    long blocksReceived;
+    /**
+     * number of blocks sent over the connection
+     */
+    long blocksSent;
 
+    /**
+     * counter for incorrect blocks,
+     * connection could be dropped in such case
+     * so could be not used
+     */
+    long blocksRequestedIncorrect;
 
-    long blocksReceived = 0;
-    long blocksSent = 0;
-
-    public PeerStatistics() {
+    /**
+     * constructor
+     * @param _periods number of history periods for upload/download
+     * @param _length length of each period in ms
+     */
+    public PeerConnectionStatistics(int _periods, int _length) {
+        download = new Statistics(_periods, _length);
+        upload = new Statistics(_periods, _length);
     }
 
+    /**
+     * reset all fields to start from scratch
+     */
     public void reset() {
         download.reset();
         upload.reset();
+        blocksRequestedIncorrect = 0;
+        blocksReceived = 0;
+        blocksSent = 0;
     }
 
-    public void received(long bytes) {
-        received(System.currentTimeMillis(), bytes);
-    }
-
-    public void received(long timestamp, long bytes) {
-        download.add(timestamp, bytes);
-    }
-
-    public void sent(long bytes) {
-        sent(System.currentTimeMillis(), bytes);
-    }
-
-    public void sent(long timestamp, long bytes) {
-        upload.add(timestamp, bytes);
-    }
-
-    public long downloadSpeed() {
-        return download.average() * 1000 / PERIOD;
-    }
-    public long uploadSpeed() {
-        return upload.average() * 1000 / PERIOD;
-    }
 }

@@ -38,6 +38,7 @@ public class PeerMessage {
     /**
      * - 'index' field of REQUEST, CANCEL and PIECE messages,
      * - two low bytes are used for PORT message
+     * - used as # of pieces for outgoing BITFIELD message
      */
     int index;
     /**
