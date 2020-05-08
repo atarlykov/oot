@@ -205,12 +205,25 @@ public class PeerConnection {
      */
     public boolean connected = false;
     /**
+     * timestamp of the connection event
+     */
+    public long timeConnected;
+
+    /**
      * tracks if remote handshake message
      * has been received or not, need it to switch
      * to "normal" messages processing
      */
     public boolean handshaked = false;
+    /**
+     * timestamp of the handshake event
+     */
+    long timeHandshaked;
 
+    /**
+     * tracks if bitfield has been received or not
+     */
+    public boolean bitfieldReceived;
 
     /**
      * peer protocol state
@@ -241,12 +254,6 @@ public class PeerConnection {
      * various per connection statistics
      */
     PeerConnectionStatistics statistics;
-
-
-    long timeConnected;
-    long timeHandshaked;
-    boolean bitfieldReceived;
-
 
 
     public PeerConnection(Torrent _torrent, Peer _peer) {
@@ -328,7 +335,7 @@ public class PeerConnection {
                     */
                 }
             } catch (IOException e) {
-                assert true: "peer: " + peer.address + "  io exception, setting error [1], " + e.getMessage();
+                assert false: "peer: " + peer.address + "  io exception, setting error [1], " + e.getMessage();
                 peer.setConnectionClosed(true);
             }
             // connection will be processed on the next turn
@@ -405,27 +412,39 @@ public class PeerConnection {
             return;
         }
 
-        int queueSize = getActiveBlockRequestsNumber() + getEnqueuedBlockRequestsNumber();
-        if (queueSize < DOWNLOAD_QUEUED_REQUESTS_MAX) {
-            int requests = DOWNLOAD_QUEUED_REQUESTS_MAX - queueSize;
+        // use total number of outgoing requests for planning,
+        // (this sum not meant to exceed DOWNLOAD_QUEUED_REQUESTS_MAX)
+        int enqueued = getActiveBlockRequestsNumber() + getEnqueuedBlockRequestsNumber();
+        if (enqueued < DOWNLOAD_QUEUED_REQUESTS_MAX)
+        {
+            // number of additional requests we may add to queue
+            int requests = DOWNLOAD_QUEUED_REQUESTS_MAX - enqueued;
 
-            // use speed limit if specified
+            // do we have speed limiting on?
             if (budgetDownload > 0) {
+                // number of bytes sent during the current speed controlled period
                 long last = statistics.download.last();
+                // number of requests we could send (could be negative),
+                // this simply sends request on period start (not evenly distributed)
                 int allowed = (int) (budgetDownload - last + Torrent.BLOCK_LENGTH - 1) >> Torrent.BLOCK_LENGTH_BITS;
+
                 requests = Math.min(allowed, requests);
             }
 
             if (requests <= 0) {
+                // this handles full queue
+                // and speed limit overrun (<0)
                 return;
             }
 
+            // ask torrent to allocate more blocks to download
+            // via this connection
             int allocated = torrent.enqueueBlockRequests(this, requests);
             if (allocated == 0) {
-                // seems this connection has no more data for us
-//                if (torrent.completed) {
-                    enqueue(torrent.pmCache.notInterested());
-//                }
+                // seems this connection has no more data for us,
+                // set "not interested" for now, could be dropped later
+                // on timeout dependent on completion (todo)
+                enqueue(torrent.pmCache.notInterested());
             }
         }
     }
@@ -436,7 +455,8 @@ public class PeerConnection {
      * to resend them later,
      * must be called periodically
      */
-    public void cancelTimedOutBlockRequests() {
+    public void cancelTimedOutBlockRequests()
+    {
         long now = System.currentTimeMillis();
         for (int i = blockRequests.size() - 1; 0 <= i; i--) {
             PeerMessage pm = blockRequests.get(i);
@@ -465,8 +485,7 @@ public class PeerConnection {
      */
     public int getEnqueuedBlockRequestsNumber() {
         int count = 0;
-        for (int i = 0; i < sendQueue.size(); i++) {
-            PeerMessage pm = sendQueue.get(i);
+        for (PeerMessage pm : sendQueue) {
             if (pm.type == PeerMessage.REQUEST) {
                 count++;
             }
@@ -479,8 +498,8 @@ public class PeerConnection {
      * @return true if connection established and false if still pending
      * @throws IOException if any
      */
-    boolean connect() throws IOException {
-
+    boolean connect() throws IOException
+    {
         if (channel == null) {
             // initiate connect
             channel = SocketChannel.open();
@@ -498,7 +517,7 @@ public class PeerConnection {
                 // initiate registration and other actions
                 Selector selector = torrent.getSelector();
                 // registration is internally synchronized
-                sKey = channel.register(selector, SelectionKey.OP_READ /*| SelectionKey.OP_WRITE*/, this);
+                sKey = channel.register(selector, SelectionKey.OP_READ, this);
                 // sore time for connection management
                 timeConnected = System.currentTimeMillis();
             }
@@ -521,7 +540,7 @@ public class PeerConnection {
         // release messages
         sendQueue.forEach( pm -> torrent.pmCache.release(pm) );
         sendQueue.clear();
-
+        // and active requests
         blockRequests.forEach( pm -> torrent.pmCache.release(pm) );
         blockRequests.clear();
 
@@ -594,7 +613,7 @@ public class PeerConnection {
             }
             return n;
         } catch (IOException e) {
-            assert true: peer.address + " error [1], " + e.getMessage();
+            assert false: peer.address + " error [1], " + e.getMessage();
             close();
             return 0;
         }
@@ -659,7 +678,7 @@ public class PeerConnection {
             if (!populated) {
                 // this must drop the connection
                 // due to unrecoverable error
-                assert true: peer.address + " error [2]";
+                assert false: peer.address + " error [2]";
                 close();
                 return;
             }
@@ -830,7 +849,7 @@ public class PeerConnection {
             n = channel.read(recvBuffer);
         } catch (IOException e) {
             // drop the connection
-            assert true: peer.address + " error [3], " + e.getMessage();
+            assert false: peer.address + " error [3], " + e.getMessage();
             close();
             return;
         }
@@ -838,7 +857,7 @@ public class PeerConnection {
         if (n == -1) {
             // end of stream, close connection
             // that could be connection close in case of seed-seed
-            assert true: peer.address + " error [4]";
+            assert false: peer.address + " error [4]";
             close();
             return;
         }
@@ -955,9 +974,9 @@ public class PeerConnection {
     }
 
 
-    /**
+    /*
      * onXxx methods are called when appropriate message has been received
-     * from the external peer, processing started in {@link #receive()}
+     * from the external peer, global connection processing starts in {@link #receive()}
      */
 
     /**
@@ -974,7 +993,7 @@ public class PeerConnection {
     void onHandshake(byte[] reserved, HashId torrentId, HashId peerId) {
         handshaked = true;
         timeHandshaked = System.currentTimeMillis();
-        System.out.println(peer.address + "  handshaked");
+        assert false: peer.address + "  handshaked";
     }
 
     /**
@@ -1070,7 +1089,7 @@ public class PeerConnection {
      */
     void onChoke(boolean state) {
         peerChoke = state;
-        System.out.println(peer.address + " choke: " + state);
+        assert false: peer.address + " choke: " + state;
 
         if (peerChoke) {
             // remove all enqueued requests as they will be dropped by the remote peer

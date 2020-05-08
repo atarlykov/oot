@@ -72,7 +72,7 @@ public class PeerProtocol {
         // empty ending bits couldn't be omitted
         int bytes = (pieces + 7) >> 3;
         if (length != bytes) {
-            assert true: "BITFIELD message with incorrect length";
+            assert false: "BITFIELD message with incorrect length";
             return false;
         }
 
@@ -91,7 +91,7 @@ public class PeerProtocol {
                     mask.set(bitIndex++, isBitSet);
                 }
                 else if (isBitSet) {
-                    assert true: "BITFIELD message contains incorrect bit set";
+                    assert false: "BITFIELD message contains incorrect bit set";
                     // this could be used as the reason to drop the connection,
                     // ignore for now
                     // return false;
@@ -116,7 +116,7 @@ public class PeerProtocol {
      */
     static boolean processPort(Torrent torrent, PeerConnection pc, ByteBuffer buffer, int length) {
         if (length != 2) {
-            assert true: "PORT message with incorrect length";
+            assert false: "PORT message with incorrect length";
             return false;
         }
 
@@ -137,7 +137,7 @@ public class PeerProtocol {
      */
     static boolean processHave(Torrent torrent, PeerConnection pc, ByteBuffer buffer, int length) {
         if (length != 4) {
-            assert true: "HAVE message with incorrect length";
+            assert false: "HAVE message with incorrect length";
             return false;
         }
 
@@ -158,7 +158,7 @@ public class PeerProtocol {
      */
     static boolean processRequest(Torrent torrent, PeerConnection pc, ByteBuffer buffer, int length) {
         if (length != 12) {
-            assert true: "REQUEST message with incorrect length";
+            assert false: "REQUEST message with incorrect length";
             return false;
         }
         int index = buffer.getInt();
@@ -213,7 +213,7 @@ public class PeerProtocol {
 
         // check if notified party has correctly read the data
         if ((position + length - 8) != buffer.position()) {
-            assert true: "pc.onPiece() hasn't read all data from the buffer";
+            assert false: "pc.onPiece() hasn't read all data from the buffer";
             // recover correct position
             buffer.position(position + length - 8);
         }
@@ -251,7 +251,7 @@ public class PeerProtocol {
             case PeerMessage.CHOKE:
             case PeerMessage.UNCHOKE:
                 if (length != 0) {
-                    assert true: "processMessage: choke/unchoke incorrect length";
+                    assert false: "processMessage: choke/unchoke incorrect length";
                     return false;
                 }
                 pc.onChoke(type == PeerMessage.CHOKE);
@@ -260,7 +260,7 @@ public class PeerProtocol {
             case PeerMessage.INTERESTED:
             case PeerMessage.NOT_INTERESTED:
                 if (length != 0) {
-                    assert true: "processMessage: interested/not_interested incorrect length";
+                    assert false: "processMessage: interested/not_interested incorrect length";
                     return false;
                 }
                 pc.onInterested(type == PeerMessage.INTERESTED);
@@ -285,7 +285,7 @@ public class PeerProtocol {
                 return processPort(torrent, pc, buffer, length);
 
             default:
-                assert true: "processMessage: unknown type: " + type;
+                assert false: "processMessage: unknown type: " + type;
                 // skip this message
                 buffer.position(buffer.position() + length - 1);
                 return true;

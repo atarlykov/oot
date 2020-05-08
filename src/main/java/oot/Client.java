@@ -7,6 +7,7 @@ import oot.dht.Node;
 import java.io.IOException;
 import java.nio.channels.Selector;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.*;
 
@@ -130,6 +131,7 @@ public class Client {
         @Override
         public void run() {
 
+            long timeLastBudgetsUpdate = 0;
             while (active) {
 
                 try {
@@ -143,8 +145,8 @@ public class Client {
                 }
 
 
+                long now = System.currentTimeMillis();
                 for (Torrent torrent: torrents) {
-                    long now = System.currentTimeMillis();
                     if (100 < now - torrent.timeLastUpdate) {
                         torrent.update();
                     }
@@ -152,8 +154,111 @@ public class Client {
                         torrent.dump();
                     }
                 }
+
+                if (10000 < now - timeLastBudgetsUpdate) {
+                    setBudgetDownload(budgetDownload);
+                    timeLastBudgetsUpdate = now;
+                }
             }
 
+
+        }
+    }
+
+    long budgetDownload;
+    long budgetUpload;
+
+    public long getDownloadSpeed(int seconds) {
+        long total = 0;
+        for (int i = 0; i < torrents.size(); i++) {
+            Torrent torrent = torrents.get(i);
+            total += torrent.getDownloadSpeed(seconds);
+        }
+        return total;
+    }
+
+    public long[] getDownloadSpeeds(int seconds) {
+        long[] tmp = new long[torrents.size()];
+        for (int i = 0; i < torrents.size(); i++) {
+            Torrent torrent = torrents.get(i);
+            tmp[i] = torrent.getDownloadSpeed(seconds);
+        }
+        return tmp;
+    }
+
+    public long getUploadSpeed(int seconds) {
+        long total = 0;
+        for (int i = 0; i < torrents.size(); i++) {
+            Torrent torrent = torrents.get(i);
+            total += torrent.getUploadSpeed(seconds);
+        }
+        return total;
+    }
+
+
+    /**
+     *
+     *
+     *
+     */
+
+
+    private long _populateDownloadSpeeds(int seconds, long[] data) {
+        long total = 0;
+        for (int i = 0; i < torrents.size(); i++) {
+            Torrent torrent = torrents.get(i);
+            long tSpeed = torrent.getDownloadSpeed(seconds);
+            //data[i] = (tSpeed + Torrent.BLOCK_LENGTH - 1) >> Torrent.BLOCK_LENGTH_BITS;
+            data[i] = tSpeed;
+            total += tSpeed;
+        }
+        return total;
+    }
+
+    public static final long XX_AVG_DELTA = 16384;
+    public void setBudgetDownload(long budget) {
+
+        budgetDownload = budget;
+
+        if (budget == 0) {
+            for (int i = 0; i < torrents.size(); i++) {
+                Torrent torrent = torrents.get(i);
+                torrent.setBudgetDownload(0);
+            }
+            return;
+        }
+
+        if (torrents.size() == 0) {
+            return;
+        }
+
+        long[] speeds = new long[torrents.size()];
+        long total = _populateDownloadSpeeds(4, speeds);
+        long average = total / speeds.length;
+
+        long availableBudget = budgetDownload - total;
+
+        int hightSpeedCount = 0;
+        for (int i = 0; i < torrents.size(); i++) {
+            Torrent torrent = torrents.get(i);
+            long speed = speeds[i];
+
+            if (speed < average - XX_AVG_DELTA) {
+                // let this torrent to use more bandwidth,
+                // soft target is the same speed for all
+                torrent.setBudgetDownload(average);
+            } else {
+                hightSpeedCount++;
+            }
+        }
+
+        for (int i = 0; i < torrents.size(); i++) {
+            Torrent torrent = torrents.get(i);
+            long speed = speeds[i];
+
+            if (average - XX_AVG_DELTA <= speed) {
+                torrent.setBudgetDownload(speed + availableBudget/hightSpeedCount);
+            }
         }
     }
 
