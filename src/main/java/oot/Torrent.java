@@ -72,6 +72,11 @@ public class Torrent {
      * number of bits used to represent length of a block
      */
     public static final int BLOCK_LENGTH_BITS = Integer.bitCount(BLOCK_LENGTH_MASK);
+    /**
+     * period of torrent state save (pieces downloaded and active) in ms,
+     * used only for uncompleted torrents
+     */
+    public static final long TORRENT_STATE_SAVE_TIMEOUT = 10_000;
 
     /**
      * ref to parent client that controls all the torrents,
@@ -84,8 +89,9 @@ public class Torrent {
      */
     Metainfo metainfo;
 
-
-    // number of blocks in piece, piece / 16K
+    /**
+     *  number of blocks in a piece, piece / 16K
+     */
     final int pieceBlocks;
 
     /**
@@ -116,7 +122,17 @@ public class Torrent {
      * state of pieces available on our size,
      * includes only pieces we have fully downloaded
      */
-    final BitSet pieces;
+    private final BitSet pieces;
+
+    /**
+     * timestamp of the last state save
+     */
+    private long timeLastSaveState = 0;
+    /**
+     * debug time of the torrent initialization
+     */
+    private long timeTorrentStart = 0;
+
 
     /**
      * describes status of a piece dividing it into blocks
@@ -136,12 +152,19 @@ public class Torrent {
          */
         BitSet active;
 
+        /**
+         * allowed constructor
+         * @param blocks number of blocks in a piece
+         */
         public PieceBlocks(int blocks) {
             ready = new BitSet(blocks);
             active = new BitSet(blocks);
             reset();
         }
 
+        /**
+         * resets to be reused
+         */
         public void reset() {
             timestamp = System.currentTimeMillis();
             ready.clear();
@@ -169,7 +192,6 @@ public class Torrent {
      */
     volatile State state;
 
-
     /**
      * do we have all the data of this torrent or not,
      * must be based on pieces.cardinality()
@@ -177,7 +199,9 @@ public class Torrent {
      */
     volatile boolean completed;
 
-
+    /**
+     * list of associated trackers
+     */
     List<Tracker> trackers;
 
     /**
@@ -187,7 +211,20 @@ public class Torrent {
      */
     PeerMessageCache pmCache = new PeerMessageCache();
 
+    /**
+     * download speed limit of this torrent, in bytes/sec
+     */
+    private long speedLimitDownload;
+    /**
+     * upload speed limit of this torrent, in bytes/sec
+     */
+    private long speedLimitUpload;
 
+    /**
+     * allowed constructor
+     * @param _client client that handles torrents
+     * @param _metainfo meta info of the torrent
+     */
     private Torrent(Client _client, Metainfo _metainfo) {
         client = _client;
         metainfo = _metainfo;
@@ -203,32 +240,45 @@ public class Torrent {
         }
     }
 
+    /**
+     * allowed constructor
+     * @param _client client that handles torrents
+     * @param _metainfo meta info of the torrent
+     * @param _storage storage to be used to read/write torrent data
+     */
     public Torrent(Client _client, Metainfo _metainfo, Storage.TorrentStorage _storage) {
         this(_client, _metainfo);
         storage = _storage;
     }
 
+    /**
+     * @return ref to the associated client
+     */
     public Client getClient() {
         return client;
     }
 
     /**
-     * per-torrent selector, but could be only one selector for a client
-     * @return
+     * @return ref to the meta info of the torrent
+     */
+    public Metainfo getMetainfo() {
+        return metainfo;
+    }
+
+    /**
+     * per-torrent selector, could be only one selector for a client now
+     * @return selector
      */
     public Selector getSelector() {
         return getClient().selector;
     }
 
-    public Metainfo getMetainfo() {
-        return metainfo;
-    }
-
+    /**
+     * @return ref to the associated storage api
+     */
     public Storage.TorrentStorage getStorage() {
         return storage;
     }
-
-
 
     /**
      * creates new instance of PieceBlocks to be used for
@@ -576,19 +626,14 @@ public class Torrent {
         }
     }
 
-
-
-    long timeLastUpdate = 0;
-    long timeLastSaveState = 0;
-
     /**
      * this method is called periodically by client to update state,
      * open/close new connections, send keep alive messages,
      * perform some maintenance, etc.
      */
-    void update() {
-
-        timeLastUpdate = System.currentTimeMillis();
+    void update()
+    {
+        long now = System.currentTimeMillis();
 
         if (state == State.UNKNOWN) {
             state = State.INITIALIZING;
@@ -604,6 +649,7 @@ public class Torrent {
 
         if (state == State.INITIALIZED) {
             restoreState();
+            timeTorrentStart = now;
             state = State.ACTIVE;
         }
 
@@ -611,9 +657,9 @@ public class Torrent {
             updateConnections();
             updateTrackers();
 
-            if (!completed && (5000 < timeLastUpdate - timeLastSaveState)) {
+            if (!completed && (TORRENT_STATE_SAVE_TIMEOUT < now - timeLastSaveState)) {
                 saveState();
-                timeLastSaveState = timeLastUpdate;
+                timeLastSaveState = now;
             }
         }
 
@@ -682,7 +728,7 @@ public class Torrent {
             PeerConnection pc = new PeerConnection(this, peer);
             connections.put(peer, pc);
 
-            setBudgetDownload(budgetDownload);
+            setDownloadSpeedLimit(speedLimitDownload);
 
             System.out.println("peer: " + peer.address + "  connection initiated");
             break;
@@ -757,18 +803,18 @@ public class Torrent {
     void onStorageError() {
     }
 
-    long tStart = System.currentTimeMillis();
 
     /**
      * called from this torrent when last
      * piece of torrent is finished
      */
-    void onFinished() {
+    void onFinished()
+    {
         System.out.println("FINISHED");
         completed = true;
         saveState();
 
-        long time = System.currentTimeMillis() - tStart;
+        long time = System.currentTimeMillis() - timeTorrentStart;
         System.out.println("time: " + ((double)time)/1000 + "s");
     }
 
@@ -782,7 +828,7 @@ public class Torrent {
      * @param length length of the block, must be == buffer.remaining()
      */
     void onPiece(PeerConnection pc, ByteBuffer buffer, int index, int begin, int length) {
-        storage.write(buffer, index, begin, length, (result) -> {
+        storage.writeBlock(buffer, index, begin, length, (result) -> {
             // this could be called from some other thread (storage)
             int block = begin >> BLOCK_LENGTH_BITS;
             markBlockDownloaded(index, block);
@@ -802,12 +848,11 @@ public class Torrent {
         // todo: move buffer get to storage ?
         // buffer will be release in send() on message serialization
         final ByteBuffer buffer = storage.getBuffer();
-        storage.read(buffer, index, begin, length, result -> {
+        storage.readBlock(buffer, index, begin, length, result -> {
             PeerMessage pm = pmCache.piece(index, begin, length, buffer);
             pc.enqueue(pm);
         });
     }
-
 
     /**
      * called from a connection to notify that physical connection is closed
@@ -819,13 +864,136 @@ public class Torrent {
         new Exception().printStackTrace();
     }
 
+    /**
+     * populates given structures with copy of the state of the torrent
+     * @param _pieces state of all pieces
+     * @param _active state of the pieces being downloaded
+     */
+    public void getCompletionState(BitSet _pieces, Map<Integer, BitSet> _active)
+    {
+        _pieces.clear();
+        _pieces.or(pieces);
+
+        _active.clear();
+        piecesActive.forEach( (p, m) -> {
+            BitSet tmp = new BitSet(pieceBlocks);
+            tmp.or(m.ready);
+            _active.put(p, tmp);
+        });
+    }
+
+    /**
+     * initiates save store via the associated storage api
+     */
+    private void saveState() {
+        storage.writeState(pieces, piecesActive);
+    }
+
+    /**
+     * restores state loading it from the storage
+     */
+    private void restoreState() {
+        storage.readState(pieces, piecesActive);
+        completed = pieces.cardinality() == metainfo.pieces;
+    }
 
 
 
-    long timeLastDump = 0;
-    public void dump() {
-        timeLastDump = System.currentTimeMillis();
+    /**
+     * note: not real history, only active connections are used for calculation
+     * @param seconds number of seconds
+     * @return average download speed for all connections of this torrent
+     */
+    public long getDownloadSpeed(int seconds) {
+        long total = 0;
+        for (PeerConnection pc : connections.values()) {
+            total += pc.getDownloadSpeed(seconds);
+        }
+        return total;
+    }
 
+    /**
+     * note: not real history, only active connections are used for calculation
+     * @param seconds number of seconds
+     * @return average upload speed for all connections of this torrent
+     */
+    public long getUploadSpeed(int seconds) {
+        long total = 0;
+        for (PeerConnection pc : connections.values()) {
+            total += pc.getUploadSpeed(seconds);
+        }
+        return total;
+    }
+
+    /**
+     * sets download limit for this torrent, managed by parent client,
+     * note: could be easily extended to support per torrent limits
+     * @param budget number of bytes/sec
+     */
+    public void setDownloadSpeedLimit(long budget)
+    {
+        speedLimitDownload = budget;
+
+        if (connections.size() == 0) {
+            return;
+        }
+
+        // reset connections' limit if reset fot his torrent
+        if (speedLimitDownload == 0) {
+            for (PeerConnection pc : connections.values()) {
+                pc.speedLimitDownload = 0;
+            }
+            return;
+        }
+
+        // make stable copy
+        PeerConnection[] pcs = connections.values().toArray(PeerConnection[]::new);
+
+        // calculate download speeds of all connections
+        long[] speeds = new long[pcs.length];
+        long totalSpeed = 0;
+        for (int i = 0; i < pcs.length; i++) {
+            PeerConnection pc = pcs[i];
+            long speed = pc.getDownloadSpeed(2);
+            speeds[i] = speed;
+            totalSpeed += speed;
+        }
+
+        long averageSpeedLimit = speedLimitDownload / pcs.length;
+        long availableSpeedBudget = speedLimitDownload - totalSpeed;
+
+        int index = 0;
+        int hightSpeedCount = 0;
+        for (PeerConnection pc : pcs) {
+            long speed = speeds[index++];
+
+            if (speed < averageSpeedLimit - Torrent.BLOCK_LENGTH) {
+                // let this torrent to use more bandwidth,
+                // soft target is the same speed for all
+                pc.speedLimitDownload = averageSpeedLimit;
+            } else {
+                // plan this connection for more processing
+                hightSpeedCount++;
+            }
+        }
+
+        // divide not used throughput equally between quick connections
+        index = 0;
+        long averageSpeedBudget = availableSpeedBudget / hightSpeedCount;
+        for (PeerConnection pc : pcs) {
+            long speed = speeds[index++];
+            if (averageSpeedLimit - Torrent.BLOCK_LENGTH <= speed) {
+                pc.speedLimitDownload = speed + averageSpeedBudget;
+            }
+        }
+    }
+
+
+    /**
+     * dumps active connections of the torrent to stdout
+     */
+    public void dump()
+    {
         Formatter formatter = new Formatter();
         formatter.format("                              L  P                                 \n");
         formatter.format("                          C H CI CI  DLR RQ   BLKS |  UPL  Q   BLKS\n");
@@ -851,115 +1019,11 @@ public class Torrent {
                     drate, pc.blockRequests.size(), s.blocksReceived,
                     urate, 0, s.blocksSent);
         });
-        formatter.format(" peer messages created: %d\n", pmCache.counter);
+        formatter.format(" peer messages created: %d\n", PeerMessageCache.counter);
         formatter.format("     buffers allocated: %d\n", SimpleFileStorage.buffersAllocated);
+        formatter.format("                 state: %s\n", state.name());
         //formatter.format("       save task queue: %d\n", SimpleFileStorage.exSave.getQueue().size());
 
         System.out.println(formatter.toString());
     }
-
-    public void getCompletionState(BitSet _pieces, Map<Integer, BitSet> active) {
-        _pieces.clear();
-        _pieces.or(pieces);
-
-        active.clear();
-        piecesActive.forEach( (p, m) -> {
-            BitSet tmp = new BitSet(pieceBlocks);
-            tmp.or(m.ready);
-            active.put(p, tmp);
-        });
-    }
-
-    public void saveState() {
-        storage.writeState(pieces, piecesActive);
-    }
-
-    public void restoreState() {
-        storage.readState(pieces, piecesActive);
-        completed = pieces.cardinality() == metainfo.pieces;
-    }
-
-
-    long budgetDownload;
-    long budgetUpload;
-
-    public long getDownloadSpeed(int seconds) {
-        long total = 0;
-        for (Iterator<PeerConnection> iterator = connections.values().iterator(); iterator.hasNext(); ) {
-            PeerConnection pc = iterator.next();
-            total += pc.getDownloadSpeed(seconds);
-        }
-        return total;
-    }
-    public long getUploadSpeed(int seconds) {
-        long total = 0;
-        for (Iterator<PeerConnection> iterator = connections.values().iterator(); iterator.hasNext(); ) {
-            PeerConnection pc = iterator.next();
-            total += pc.getUploadSpeed(seconds);
-        }
-        return total;
-    }
-
-
-    private long _populateDownloadSpeeds(int seconds, long[] data) {
-
-        long total = 0;
-        int index = 0;
-        for (Iterator<PeerConnection> iterator = connections.values().iterator(); iterator.hasNext(); ) {
-            PeerConnection pc = iterator.next();
-            long speed = pc.getDownloadSpeed(seconds);
-            data[index++] = speed;
-            total += speed;
-        }
-        return total;
-    }
-
-    public static final long XX_AVG_DELTA = 16384;
-    public void setBudgetDownload(long budget) {
-
-        budgetDownload = budget;
-        if (budget == 0) {
-            for (Iterator<PeerConnection> iterator = connections.values().iterator(); iterator.hasNext(); ) {
-                PeerConnection pc = iterator.next();
-                pc.budgetDownload = 0;
-            }
-            return;
-        }
-
-        if (connections.size() == 0) {
-            return;
-        }
-
-        long[] speeds = new long[connections.size()];
-        long total = _populateDownloadSpeeds(4, speeds);
-        long averageBudget = budgetDownload / speeds.length;
-
-        long availableBudget = budgetDownload - total;
-
-        int index = 0;
-        int hightSpeedCount = 0;
-        for (Iterator<PeerConnection> iterator = connections.values().iterator(); iterator.hasNext(); ) {
-            PeerConnection pc = iterator.next();
-            long speed = speeds[index++];
-
-            if (speed < averageBudget - XX_AVG_DELTA) {
-                // let this torrent to use more bandwidth,
-                // soft target is the same speed for all
-                pc.budgetDownload = averageBudget;
-            } else {
-                hightSpeedCount++;
-            }
-        }
-
-        index = 0;
-        for (Iterator<PeerConnection> iterator = connections.values().iterator(); iterator.hasNext(); ) {
-            PeerConnection pc = iterator.next();
-            long speed = speeds[index++];
-
-            if (averageBudget - XX_AVG_DELTA <= speed) {
-                pc.budgetDownload = speed + availableBudget/hightSpeedCount;
-            }
-        }
-    }
-
 }
