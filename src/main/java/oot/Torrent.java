@@ -127,11 +127,19 @@ public class Torrent {
     /**
      * timestamp of the last state save
      */
-    private long timeLastSaveState = 0;
+    long timeLastStateSave = 0;
+    /**
+     * timestamp of the last call to update
+     */
+    long timeLastUpdate = 0;
+    /**
+     * timestamp of the last torrent dump (debug only)
+     */
+    long timeLastDump = 0;
     /**
      * debug time of the torrent initialization
      */
-    private long timeTorrentStart = 0;
+    long timeTorrentStart = 0;
 
 
     /**
@@ -633,7 +641,7 @@ public class Torrent {
      */
     void update()
     {
-        long now = System.currentTimeMillis();
+        long timeLastUpdate = System.currentTimeMillis();
 
         if (state == State.UNKNOWN) {
             state = State.INITIALIZING;
@@ -649,7 +657,7 @@ public class Torrent {
 
         if (state == State.INITIALIZED) {
             restoreState();
-            timeTorrentStart = now;
+            timeTorrentStart = timeLastUpdate;
             state = State.ACTIVE;
         }
 
@@ -657,9 +665,9 @@ public class Torrent {
             updateConnections();
             updateTrackers();
 
-            if (!completed && (TORRENT_STATE_SAVE_TIMEOUT < now - timeLastSaveState)) {
+            if (!completed && (TORRENT_STATE_SAVE_TIMEOUT < timeLastUpdate - timeLastStateSave)) {
                 saveState();
-                timeLastSaveState = now;
+                timeLastStateSave = timeLastUpdate;
             }
         }
 
