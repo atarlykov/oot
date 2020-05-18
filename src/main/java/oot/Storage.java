@@ -12,6 +12,8 @@ import java.util.function.Consumer;
  */
 public abstract class Storage {
 
+    int blockSize;
+
 
     /**
      * state of a torrent from the storage point of view
@@ -34,17 +36,24 @@ public abstract class Storage {
      * stores torrent specific data and provides access to global storage api
      */
     public abstract class TorrentStorage {
-
         /**
          * ref to the metainfo of a torrent that is serviced with this instance
          */
-        //Torrent torrent;
         Metainfo metainfo;
-
         /**
          * state of the this TorrentStorage
          */
         TorrentStorageState state;
+
+        /**
+         * allowed constructor
+         * @param metainfo meta info of the torrent
+         * @param state initial state
+         */
+        public TorrentStorage(Metainfo metainfo, TorrentStorageState state) {
+            this.metainfo = metainfo;
+            this.state = state;
+        }
 
         /**
          * @return generic state of the torrent storage
@@ -61,28 +70,11 @@ public abstract class Storage {
         public void init(Consumer<Boolean> callback) {}
 
         /**
+         * todo: must find correct pieces
          * starts check process
          * @param callback callback to be notified on finish
          */
         public void check(Consumer<Boolean> callback) {}
-
-        /**
-         * allocates new return cached instance of a buffer to be used
-         * for block data
-         * @return buffer
-         */
-        public abstract ByteBuffer getBuffer();
-
-        /**
-         * returns buffer to be reused later
-         * @param buffer buffer to return
-         */
-        public abstract void releaseBuffer(ByteBuffer buffer);
-
-
-        public void writeState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {}
-        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {}
-
 
         /**
          * sends block of data to the storage for save operation, find correct place (file) that contains the block,
@@ -98,7 +90,7 @@ public abstract class Storage {
          * @param length size of the data
          * @param callback callback to be notified on success/errors
          */
-        public void write(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {}
+        public void writeBlock(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {}
 
         /**
          * requests block of data to be read into the buffers from torrent's storage (file or some other place)
@@ -116,7 +108,21 @@ public abstract class Storage {
          * @param length size of the data
          * @param callback callback to be notified on success/errors
          */
-        public void read(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {}
+        public void readBlock(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {}
+
+        /**
+         * writes state of the torrent to be available later in case of restarts
+         * @param pieces state of pieces
+         * @param active state of blocks for pieces being downloaded
+         */
+        public void writeState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {}
+
+        /**
+         * reads state of the torrent into the specified structures
+         * @param pieces will be populated with pieces state
+         * @param active will be populated with active pieces state
+         */
+        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {}
 
         /**
          * this could be used to limit number of ingoing requests and/or send choke commands
@@ -133,13 +139,61 @@ public abstract class Storage {
         public int getWriteQueueSize() {
             return 0;
         }
+
+        /**
+         * allocates new or returns cached instance of a buffer to be used
+         * for reading/writing block data
+         * @return buffer
+         */
+        public ByteBuffer getBuffer() {
+            return ByteBuffer.allocateDirect(blockSize);
+        }
+
+        /**
+         * returns buffer to be reused later
+         * @param buffer buffer to return
+         */
+        public void releaseBuffer(ByteBuffer buffer) {}
     }
 
 
-    public abstract void stop();
+    /**
+     * called to perform initialization
+     */
+    public void init() {}
+
+    /**
+     * called to stop the storage
+     */
+    public void stop() {}
+
+    /**
+     * writes some data under the specified key,
+     * could be used to save DHT table or something else
+     * @param key key
+     * @param data data to save
+     */
+    public abstract void write(String key, byte[] data);
+
+    /**
+     * reads previously saved data under the specified key
+     * @param key key
+     * @return data if found or null
+     */
+    public abstract byte[] read(String key);
+
+    /**
+     * allowed constructor
+     * @param blockSize size of the block we are operating with,
+     *                  used for buffers allocations
+     */
+    public Storage(int blockSize) {
+        this.blockSize = blockSize;
+    }
 
     /**
      * create instance of {@link TorrentStorage} to be used from corresponding {@link Torrent} class
+     * as a facade to storage engine
      * @param metainfo metainfo of the torrent
      * @return instance to be used as api to storage
      */
