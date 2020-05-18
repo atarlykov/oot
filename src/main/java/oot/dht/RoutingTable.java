@@ -27,6 +27,18 @@ public class RoutingTable {
         // to consider it ad dead
         static final long NODE_DEAD_REPLIES  = 2;
 
+        // length of the local token generated
+        // for communication with this node
+        static final int TOKEN_LOCAL_LENGTH  = 8;
+
+        // timeout for local tokens
+        static final long TOKEN_LOCAL_TIMEOUT = 24*60*60*1000;
+        // timeout for received tokens
+        //static final long TOKEN_EXTERNAL_TIMEOUT = 24*60*60*1000;
+
+        // timeout for node to be considered as downloader
+        // after the last announce received
+        static final long NODE_ANNOUNCE_TIMEOUT = 60*60*1000;
 
         // unique fixed node id
         final HashId id;
@@ -36,50 +48,122 @@ public class RoutingTable {
         // not the original id
         final HashId distance;
 
-        // address of the node
+        // address of the node, this
+        // is used for DHT communications
         InetSocketAddress address;
 
-        // token returned by find_peers query to this remote node
+        // port used by the remote peer to accept
+        // incoming peer-2-peer connections,
+        // zero if DHT port from #address must be used
+        int peerPort;
+
+        // token returned by find_peers query to this remote node,
+        // will be sent with announce messages to this node
         byte[] token;
 
-        // timestamp of the last acivity - creation time, query or reply received
-        long lastActivityTime;
+        // generated token for get_peers messages to this node,
+        // that's enough to have only 1 token for all requests from the same ip,
+        // just protection from some node to sign more nodes (ip addresses) with the same token
+        private byte[] tokenLocal;
+
+        // timestamp of the last activity - creation time, query or reply received
+        long timeLastActivity;
+
+        // timestamp of the last local token generated
+        long timeTokenLocal;
+
+        // timestamp of the last token received from this node (could be removed later)
+        long timeToken;
+
+        // timestamp of an external announce message from this node
+        long timeAnnounceExtenal;
 
         // ??
         int deadReplies = 0;
 
-        //
+        /**
+         * allowed constructor
+         * @param _id ndoe id
+         * @param _address remote address
+         */
         RemoteNode(HashId _id, InetSocketAddress _address) {
             id = _id;
             address = _address;
             distance = node.id.distance(id);
-            lastActivityTime = System.currentTimeMillis();
+            timeLastActivity = System.currentTimeMillis();
         }
 
-
+        /**
+         * @return true is this node iss still considered as alive
+         */
         boolean isAlive() {
-            return (deadReplies < NODE_DEAD_REPLIES) && (System.currentTimeMillis() < lastActivityTime + NODE_DEAD_TIMEOUT);
+            return (deadReplies < NODE_DEAD_REPLIES)
+                    && (System.currentTimeMillis() < timeLastActivity + NODE_DEAD_TIMEOUT);
         }
 
+        /**
+         * @return true if ping timeout is reached
+         */
         boolean isReadyForPing() {
-            return lastActivityTime + NODE_PING_TIMEOUT < System.currentTimeMillis();
+            return timeLastActivity + NODE_PING_TIMEOUT < System.currentTimeMillis();
         }
 
+        /**
+         * @return true if node could be considered as dead one
+         */
         boolean isDead() {
-            return lastActivityTime + NODE_DEAD_TIMEOUT < System.currentTimeMillis();
+            return timeLastActivity + NODE_DEAD_TIMEOUT < System.currentTimeMillis();
         }
 
+        /**
+         * @return true if local token has expired
+         */
+        boolean isTokenLocalExpired() {
+            return timeTokenLocal + TOKEN_LOCAL_TIMEOUT < System.currentTimeMillis();
+        }
 
+        /**
+         * @return true if announce received from the node has expired
+         */
+        boolean isAnnounceExternalExpired() {
+            return timeAnnounceExtenal + NODE_ANNOUNCE_TIMEOUT < System.currentTimeMillis();
+        }
 
+        /**
+         * @return existing or newly generated token
+         */
+        public byte[] getTokenLocal() {
+            if (tokenLocal == null) {
+                tokenLocal = new byte[TOKEN_LOCAL_LENGTH];
+                new Random().nextBytes(tokenLocal);
+            }
+            return tokenLocal;
+        }
+
+        /**
+         * sets peer port of this node
+         * @param _port port
+         */
+        public void setPeerPort(int _port) {
+            peerPort = _port;
+        }
+
+        /**
+         * updates last activity time of the node,
+         * current time in milliseconds is used
+         */
         void updateLastActivityTime() {
             updateLastActivityTime(System.currentTimeMillis());
         }
 
+        /**
+         * updates last activity time of the node
+         * @param _timestamp last known activity time
+         */
         void updateLastActivityTime(long _timestamp) {
-            lastActivityTime = _timestamp;
+            timeLastActivity = _timestamp;
             deadReplies = 0;
         }
-
 
         /**
          * method to be used for distance based orderings
@@ -274,13 +358,9 @@ public class RoutingTable {
         this.node = node;
     }
 
-    // review: some type of persistence for node/table
-    static RoutingTable load() {
-        return null;
-    }
-
     /**
-     * inserts another known DHT node into this routing table
+     * inserts another known DHT node into this routing table,
+     * could be used for initial bootstrapping
      * @param node node to insert
      * @return inserted node specified as parameter or the one
      * with the same id that is already in the tree,
@@ -289,6 +369,19 @@ public class RoutingTable {
      */
     public RemoteNode insert(RemoteNode node) {
         return root.insert(node);
+    }
+
+    /**
+     * inserts another known DHT node into this routing table
+     * @param id id of the node to insert
+     * @param address address of the node
+     * @return inserted node specified as parameter or the one
+     * with the same id that is already in the tree,
+     * returns NULL if node was not added due to space limits
+     * @see RoutingTable#insert(RemoteNode)
+     */
+    public RemoteNode insert(HashId id, InetSocketAddress address) {
+        return insert(new RemoteNode(id, address));
     }
 
     /**
@@ -303,22 +396,9 @@ public class RoutingTable {
             nodeInTable.updateLastActivityTime();
             if (node.token != null) {
                 nodeInTable.token = node.token;
+                nodeInTable.timeToken = System.currentTimeMillis();
             }
         }
-    }
-
-
-    /**
-     * inserts another known DHT node into this routing table
-     * @param id id of the node to insert
-     * @param address address of the node
-     * @return inserted node specified as parameter or the one
-     * with the same id that is already in the tree,
-     * returns NULL if node was not added due to space limits
-     * @see RoutingTable#insert(RemoteNode)
-     */
-    public RemoteNode insert(HashId id, InetSocketAddress address) {
-        return insert(new RemoteNode(id, address));
     }
 
     /**
@@ -335,7 +415,7 @@ public class RoutingTable {
     /**
      * searches the routing table for closest nodes to the given target hash
      * @param target hash id to find closes nodes to
-     * @return list of nodes available in the routing table, size is limited to {@link Bucket#K} elements
+     * @return not null list of nodes available in the routing table, size is limited to {@link Bucket#K} elements
      */
     List<RoutingTable.RemoteNode> findClosestNodes(HashId target) {
         List<RemoteNode> nodes = new ArrayList<>(Bucket.K);
@@ -343,7 +423,7 @@ public class RoutingTable {
         Bucket bucket = root;
         do {
             for (RemoteNode node: bucket.elements) {
-                _populateClosestList(target, nodes, distances, node);
+                populateClosestList(target, nodes, distances, node);
             }
             bucket = bucket.child;
         } while (bucket != null);
@@ -375,7 +455,7 @@ public class RoutingTable {
      * @param distances utility array of the size {@link Bucket#K} with distance for elements in nodes list
      * @param node another node to add into the closest collection
      */
-    void _populateClosestList(HashId target, List<RemoteNode> nodes, HashId[] distances, RemoteNode node) {
+    void populateClosestList(HashId target, List<RemoteNode> nodes, HashId[] distances, RemoteNode node) {
         // make alias
         int nodesSize = nodes.size();
 
@@ -460,7 +540,9 @@ public class RoutingTable {
         } while (true);
     }
 
-
+    /**
+     * @return total number of nodes inside the table
+     */
     public int count() {
         int counter = 0;
         Bucket current = root;
@@ -471,6 +553,9 @@ public class RoutingTable {
         return counter;
     }
 
+    /**
+     * @return number of levels inside the table
+     */
     public int levels() {
         int levels = 0;
         Bucket current = root;
@@ -479,5 +564,18 @@ public class RoutingTable {
             levels++;
         } while (current != null);
         return levels;
+    }
+
+    /**
+     * @return list of all remote nodes from the routing table
+     */
+    public List<RemoteNode> getRemoteNodes() {
+        List<RemoteNode> tmp = new ArrayList<>();
+        Bucket current = root;
+        do {
+            tmp.addAll(current.elements);
+            current = current.child;
+        } while (current != null);
+        return tmp;
     }
 }
