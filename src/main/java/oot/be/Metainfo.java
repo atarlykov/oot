@@ -22,8 +22,18 @@ public class Metainfo {
      */
     private HashId infohash;
 
+    /**
+     * total bytes in torrent's data
+     */
     public long length;
+    /**
+     * size of each piece in bytes
+     */
     public long pieceLength;
+    /**
+     * total number of pieces,
+     * calculated from length and pieceLength
+     */
     public long pieces;
 
     // from announce url(s)
@@ -107,30 +117,20 @@ public class Metainfo {
     }
 
     private void populate() {
-        BEValue value = getValue("info.length");
-        if ((value != null) && (value.isInteger())) {
-            length = value.integer;
-        }
 
-        value = getValue("info.piece length");
-        if ((value != null) && (value.isInteger())) {
-            pieceLength = value.integer;
-        }
-
-        if (0 < pieceLength) {
-            pieces = (length + pieceLength - 1) / pieceLength;
-        }
 
         BEValue beName = getValue("info.name");
         String name = new String(beName.bString, StandardCharsets.UTF_8);
 
-        value = getValue("info.length");
+        BEValue value = getValue("info.length");
         if (value != null) {
             // single file mode
+            length = value.integer;
             files.add(new FileInfo(value.integer, List.of(name)));
             directory = null;
         } else {
             // multi file mode
+            length = 0;
             directory = name;
             BEValue beFiles = getValue("info.files");
             for (BEValue beFile: beFiles.list) {
@@ -142,7 +142,17 @@ public class Metainfo {
                                 .map(be -> new String(be.bString, StandardCharsets.UTF_8))
                                 .collect(Collectors.toList())
                 ));
+                length += beLength.integer;
             }
+        }
+
+        value = getValue("info.piece length");
+        if ((value != null) && (value.isInteger())) {
+            pieceLength = value.integer;
+        }
+
+        if (0 < pieceLength) {
+            pieces = (length + pieceLength - 1) / pieceLength;
         }
 
         value = getValue("announce-list");

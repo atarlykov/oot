@@ -135,6 +135,102 @@ public class BEValue {
 
 
     /**
+     * @param value parsed binary encoded value
+     * @return true if value has integer type
+     */
+    public static boolean isInteger(BEValue value) {
+        return (value != null) && (value.type == BEValueType.INT);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has binary string type
+     */
+    public static boolean isBString(BEValue value) {
+        return (value != null) && (value.type == BEValueType.BSTR);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has binary string type and string is not null
+     */
+    public static boolean isBStringNotNull(BEValue value) {
+        return isBString(value) && (value.bString != null);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has binary string type and string is not empty
+     */
+    public static boolean isBStringNotEmpty(BEValue value) {
+        return isBStringNotNull(value) && (value.bString.length != 0);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has binary string type and string has specific length
+     */
+    public static boolean isBStringWithLength(BEValue value, int length) {
+        return isBStringNotNull(value) && (value.bString.length == length);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has binary string type and string has at least the specified length
+     */
+    public static boolean isBStringAtLeast(BEValue value, int length) {
+        return isBStringNotNull(value) && (value.bString.length >= length);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has dictionary type
+     */
+    public static boolean isDict(BEValue value) {
+        return (value != null) && (value.type == BEValueType.DICT);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has dictionary type and dictionary is not null
+     */
+    public static boolean isDictNotNull(BEValue value) {
+        return isDict(value) && (value.dictionary != null);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has dictionary type and dictionary is not empty
+     */
+    public static boolean isDictNotEmpty(BEValue value) {
+        return isDictNotNull(value) && !value.dictionary.isEmpty();
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has list type
+     */
+    public static boolean isList(BEValue value) {
+        return (value != null) && (value.type == BEValueType.LIST);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has list type and list is not null
+     */
+    public static boolean isListNotNull(BEValue value) {
+        return isList(value) && (value.list != null);
+    }
+
+    /**
+     * @param value parsed binary encoded value
+     * @return true if value has list type and list is not empty
+     */
+    public static boolean isListNotEmpty(BEValue value) {
+        return isListNotNull(value) && !value.list.isEmpty();
+    }
+
+    /**
      * recursively dumps node to stdout
      * @param intent intent for the current dump level
      */
@@ -157,21 +253,5 @@ public class BEValue {
                 });
                 break;
         }
-    }
-
-
-    public static boolean isBString(BEValue value) {
-        return (value != null) && (value.type == BEValueType.BSTR);
-    }
-
-    public static boolean isDict(BEValue value) {
-        return (value != null) && (value.type == BEValueType.DICT);
-    }
-    public static boolean isDictNotEmpty(BEValue value) {
-        return isDict(value) && !value.dictionary.isEmpty();
-    }
-
-    public static boolean isList(BEValue value) {
-        return (value != null) && (value.type == BEValueType.LIST);
     }
 }
