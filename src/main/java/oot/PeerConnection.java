@@ -20,6 +20,9 @@ import java.util.stream.Stream;
  * by the Client to serve the Torrent
  */
 public class PeerConnection {
+    // debug switch
+    private static final boolean DEBUG = true;
+
     /**
      * max number of active piece requests (for blocks) could be sent
      * to any external peer (it's 5 by the spec, but should be higher on good connections)
@@ -255,6 +258,23 @@ public class PeerConnection {
      */
     PeerConnectionStatistics statistics;
 
+    /**
+     * download speed limit in bytes/sec or zero if unlimited,
+     * this limit is dynamic and managed by parent torrent
+     * based on global limits, per torrent limits and current
+     * throughput of all connections,
+     * used while requesting blocks from external peer
+     */
+    long speedLimitDownload;
+    /**
+     * upload speed limit in bytes/sec or zero if unlimited,
+     * this limit is dynamic and managed by parent torrent
+     * based on global limits, per torrent limits and current
+     * throughput of all connections,
+     *
+     */
+    long speedLimitUpload;
+
 
     public PeerConnection(Torrent _torrent, Peer _peer) {
         torrent = _torrent;
@@ -301,11 +321,26 @@ public class PeerConnection {
         sendQueue.clear();
 
         statistics.reset();
-        budgetDownload = 0;
-        budgetUpload = 0;
+        speedLimitDownload = 0;
+        speedLimitUpload = 0;
     }
 
 
+    /**
+     * @param seconds number of seconds
+     * @return average download speed for the specified number of seconds
+     */
+    public long getDownloadSpeed(int seconds) {
+        return statistics.download.average(seconds);
+    }
+
+    /**
+     * @param seconds number of seconds
+     * @return average upload speed for the specified number of seconds
+     */
+    public long getUploadSpeed(int seconds) {
+        return statistics.upload.average(seconds);
+    }
 
     /**
      * called periodically to update state of the connection,
@@ -335,7 +370,7 @@ public class PeerConnection {
                     */
                 }
             } catch (IOException e) {
-                assert false: "peer: " + peer.address + "  io exception, setting error [1], " + e.getMessage();
+                if (DEBUG) System.out.println("peer: " + peer.address + "  io exception, setting error [1], " + e.getMessage());
                 peer.setConnectionClosed(true);
             }
             // connection will be processed on the next turn
@@ -421,12 +456,12 @@ public class PeerConnection {
             int requests = DOWNLOAD_QUEUED_REQUESTS_MAX - enqueued;
 
             // do we have speed limiting on?
-            if (budgetDownload > 0) {
+            if (speedLimitDownload > 0) {
                 // number of bytes sent during the current speed controlled period
                 long last = statistics.download.last();
                 // number of requests we could send (could be negative),
                 // this simply sends request on period start (not evenly distributed)
-                int allowed = (int) (budgetDownload - last + Torrent.BLOCK_LENGTH - 1) >> Torrent.BLOCK_LENGTH_BITS;
+                int allowed = (int) (speedLimitDownload - last + Torrent.BLOCK_LENGTH - 1) >> Torrent.BLOCK_LENGTH_BITS;
 
                 requests = Math.min(allowed, requests);
             }
@@ -613,7 +648,7 @@ public class PeerConnection {
             }
             return n;
         } catch (IOException e) {
-            assert false: peer.address + " error [1], " + e.getMessage();
+            if (DEBUG) System.out.println(peer.address + " error [1], " + e.getMessage());
             close();
             return 0;
         }
@@ -678,7 +713,7 @@ public class PeerConnection {
             if (!populated) {
                 // this must drop the connection
                 // due to unrecoverable error
-                assert false: peer.address + " error [2]";
+                if (DEBUG) System.out.println(peer.address + " error [2]");
                 close();
                 return;
             }
@@ -849,7 +884,7 @@ public class PeerConnection {
             n = channel.read(recvBuffer);
         } catch (IOException e) {
             // drop the connection
-            assert false: peer.address + " error [3], " + e.getMessage();
+            if (DEBUG) System.out.println(peer.address + " error [3], " + e.getMessage());
             close();
             return;
         }
@@ -857,7 +892,7 @@ public class PeerConnection {
         if (n == -1) {
             // end of stream, close connection
             // that could be connection close in case of seed-seed
-            assert false: peer.address + " error [4]";
+            if (DEBUG) System.out.println(peer.address + " error [4]");
             close();
             return;
         }
@@ -993,7 +1028,7 @@ public class PeerConnection {
     void onHandshake(byte[] reserved, HashId torrentId, HashId peerId) {
         handshaked = true;
         timeHandshaked = System.currentTimeMillis();
-        assert false: peer.address + "  handshaked";
+        if (DEBUG) System.out.println(peer.address + "  handshaked");
     }
 
     /**
@@ -1089,7 +1124,7 @@ public class PeerConnection {
      */
     void onChoke(boolean state) {
         peerChoke = state;
-        assert false: peer.address + " choke: " + state;
+        if (DEBUG) System.out.println(peer.address + " choke: " + state);
 
         if (peerChoke) {
             // remove all enqueued requests as they will be dropped by the remote peer
@@ -1221,17 +1256,9 @@ public class PeerConnection {
 
 
 
-    long budgetDownload;
-    long budgetUpload;
 
     public PeerConnectionStatistics getStatistics() {
-        return null;
+        return statistics;
     }
 
-    public long getDownloadSpeed(int seconds) {
-        return statistics.download.average(seconds);
-    }
-    public long getUploadSpeed(int seconds) {
-        return statistics.upload.average(seconds);
-    }
 }
