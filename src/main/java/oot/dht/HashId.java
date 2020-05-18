@@ -91,6 +91,13 @@ public class HashId implements Comparable {
     }
 
     /**
+     * @return new hash with all elements set to zero
+     */
+    public static HashId zero() {
+        return new HashId();
+    }
+
+    /**
      * @param id id array to validate
      * @return return true if the specified array is valid to create a hash object from it
      */
