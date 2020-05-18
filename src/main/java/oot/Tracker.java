@@ -8,6 +8,11 @@ import java.net.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+/**
+ * handles trackers linked to a torrent (bep0003),
+ * stores update periods, statuses and performs
+ * actual announce requests
+ */
 public class Tracker {
 
     public static final int TIMEOUT_ANNOUNCE = 15 * 60 * 1000;
@@ -50,6 +55,11 @@ public class Tracker {
     }
 
 
+    /**
+     * must be called periodically to perform tracker update,
+     * internally controls update period to be not less than TIMEOUT_ANNOUNCE
+     * updates and run in background in service threads controlled by Client
+     */
     void update() {
         long now = System.currentTimeMillis();
         if (TIMEOUT_ANNOUNCE < now - timeLastAnnounce) {
@@ -62,24 +72,30 @@ public class Tracker {
         }
     }
 
-
-    void announce() {
-/*
+    /**
+     * perform announce call to this tracker
+     */
+    private void announce()
+    {
         String url = urls.get(urlIndex);
         if (url.startsWith("http://") || url.startsWith("https://")) {
             try {
-                BEValue beValue = announce(torrent.getClient().id, 0, torrent.metainfo.getInfohash(), url, torrent.downloaded, torrent.uploaded, torrent.left);
+
+                String query = buildAnnounceUrl(
+                        torrent.getClient().id, 0, torrent.metainfo.getInfohash(), url,
+                        /*torrent.downloaded, torrent.uploaded, torrent.left*/
+                        0, 0, torrent.metainfo.length);
+                BEValue beValue = announce(query);
                 Set<Peer> peers = parseAnnounceResponse(beValue);
                 torrent.addPeers(peers);
-                System.out.println("  " + url + "    peers:" + peers.size());
             } catch (Exception e) {
+                System.out.println(e.getMessage());
                 urlIndex = (urlIndex + 1) % urls.size();
-                System.out.println("  " + url + "    " + e.getMessage());
             }
         }
 
-*/
 
+        /*
         try {
             //Set<Peer> peers = Set.of(new Peer(new InetSocketAddress(Inet4Address.getByAddress(new byte[] {(byte)178, (byte)120, (byte)111, (byte)12}), 59121)));
             Set<Peer> peers = Set.of(new Peer(new InetSocketAddress(Inet4Address.getByAddress(new byte[] {(byte)127, (byte)0, (byte)0, (byte)1}), 42452)));
@@ -87,12 +103,12 @@ public class Tracker {
         } catch (UnknownHostException e) {
             e.printStackTrace();
         }
-
-
+        */
     }
 
     /**
-     * encodes byte array to be sent as http requests parameter (url encode)
+     * encodes byte array to be sent as http requests parameter (url encode),
+     * simply encodes all symbols including the allowed ones
      * @param data data to be encoded
      * @return string safe representation
      */
@@ -106,6 +122,17 @@ public class Tracker {
         return builder.toString();
     }
 
+    /**
+     * constructs http/https version of announce url for querying a server
+     * @param clientId unique id ot he client (20 bits SHA1)
+     * @param port port client is listening on
+     * @param infohash 20 bits SHA1 of the torrent
+     * @param announceUrl base url prefix
+     * @param downloaded total number os bytes downloaded
+     * @param uploaded total number of bytes uploaded
+     * @param left number of bytes left to have 100% of the torrent
+     * @return string representation of url
+     */
     private static String buildAnnounceUrl(
             HashId clientId, int port, HashId infohash, String announceUrl,
             long downloaded, long uploaded, long left)
@@ -122,19 +149,27 @@ public class Tracker {
         return query.toString();
     }
 
-    private static BEValue announce(HashId clientId, int port, HashId infohash, String announceUrl,
-                        long downloaded, long uploaded, long left)
+    /**
+     * performs blocking request to the specified url and
+     * parses server response into BE representation
+     * @param query url to query
+     * @return parsed server's response
+     * @throws Exception on any IO error
+     */
+    private static BEValue announce(String query)
             throws Exception
     {
-        String query = buildAnnounceUrl(clientId, port, infohash, announceUrl, downloaded, uploaded, left);
+        System.out.println(query);
         URL url = new URL(query);
 
         URLConnection urlConnection = url.openConnection();
         urlConnection.setConnectTimeout(5000);
         urlConnection.connect();
 
-        if (((HttpURLConnection)urlConnection).getResponseCode() != 200) {
+        System.out.println("response code: " + ((HttpURLConnection)urlConnection).getResponseCode());
 
+        if (((HttpURLConnection)urlConnection).getResponseCode() != 200) {
+            return null;
         }
         //((HttpURLConnection)urlConnection).getResponseMessage();
 
@@ -146,13 +181,14 @@ public class Tracker {
     }
 
     /**
-     * parses tracker reply as sent as answer to announce request
+     * parses tracker response as sent as answer to announce request
      * @param data parsed binary encoded representation
      * @return not null set with unique peers
      */
-    public Set<Peer> parseAnnounceResponse(BEValue data) {
+    public Set<Peer> parseAnnounceResponse(BEValue data)
+    {
         if ((data == null) || !data.isDict() || !data.isDictNotEmpty()) {
-            Collections.emptySet();
+            return Collections.emptySet();
         }
         BEValue beReason = data.dictionary.get("failure reason");
         if (beReason != null) {
@@ -160,7 +196,8 @@ public class Tracker {
             return Collections.emptySet();
         }
 
-        data.dictionary.get("interval");
+        // todo: support later
+        //data.dictionary.get("interval");
 
         Set<Peer> result = new HashSet<>();
 
