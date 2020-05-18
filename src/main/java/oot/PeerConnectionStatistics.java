@@ -12,7 +12,10 @@ public class PeerConnectionStatistics {
         // time period in ms for one counter
         final long period;
         // counters' data with history
-        long[] data;
+        final long[] data;
+        // full time diapason of statistics,
+        final long diapason;
+
         // currently active period
         int head;
         // last period
@@ -28,6 +31,7 @@ public class PeerConnectionStatistics {
         public Statistics(int _length, long _period) {
             data = new long[_length];
             period = _period;
+            diapason = _period * _length;
             reset();
         }
 
@@ -40,54 +44,42 @@ public class PeerConnectionStatistics {
         }
 
         /**
-         * adds value to current cell if timestamps is the same
-         * or creates new ones to make new current with the specified timestamp
-         * @param timestamp base timestamp to fund cell to add value too,
+         * adds value to current cell if timestamp is inside it's period
+         * or shifts history to make head cell ready for the specified timestamp
+         * @param timestamp timestamp of the value
          *                  could point only to the current cell or new one,
          *                  adding to history is restricted
          * @param value value to add
          */
         private void add(long timestamp, long value) {
-            long p = timestamp / period;
-            if (p != timeHead) {
-                if (p < timeHead) {
-                    // adding to old cells in restricted
-                    return;
-                }
-                grow(p - timeHead);
+            if (timestamp < timeHead) {
+                // adding to old cells in restricted
+                return;
+            }
+            if (timeHead + period < timestamp) {
+                grow(timestamp);
             }
             data[head] += value;
         }
 
         /**
-         * allocates new cells to make the head contain current time slot
+         * allocates new cells to make head cell ready to store timestamped value
+         * @param timestamp timestamp of a value to be ready to accept
          */
-        private void grow() {
-            long timestamp = System.currentTimeMillis();
-            long p = timestamp / period;
-            if (timeHead < p) {
-                grow(p - timeHead);
-            }
-        }
-
-        /**
-         * allocates new cells to allow more periods in the history
-         * @param periods number of cells to add
-         */
-        private void grow(long periods)
+        private void grow(long timestamp)
         {
-            if (data.length < periods) {
+            if (diapason < timestamp - timeHead) {
                 // clear all history,
                 // set size = 1 (tail == head)
                 head = tail = 0;
                 data[head] = 0;
-                timeHead += periods;
+
+                long periods = (timestamp - timeHead) / period;
+                timeHead += periods * period;
                 return;
             }
 
-            // move pointers, allow growing
-            // if not maximized yet
-            for (int i = 0; i < periods; i++) {
+            while (timeHead + period <= timestamp) {
                 head += 1;
                 head %= data.length;
                 if (head == tail) {
@@ -95,9 +87,8 @@ public class PeerConnectionStatistics {
                     tail %= data.length;
                 }
                 data[head] = 0;
+                timeHead += period;
             }
-
-            timeHead += periods;
         }
 
         /**
@@ -106,7 +97,7 @@ public class PeerConnectionStatistics {
         public void reset() {
             head = tail = 0;
             data[head] = 0;
-            timeHead = System.currentTimeMillis() / period;
+            timeHead = System.currentTimeMillis();
         }
 
         /**
@@ -118,7 +109,7 @@ public class PeerConnectionStatistics {
         public long average(int periods)
         {
             // make sure we have correct head pointer
-            grow();
+            grow(System.currentTimeMillis());
 
             int i = head;
             long sum = 0;
@@ -140,7 +131,7 @@ public class PeerConnectionStatistics {
          * till the end of the current period
          */
         public long last() {
-            grow();
+            grow(System.currentTimeMillis());
             return data[head];
         }
     }
@@ -153,7 +144,6 @@ public class PeerConnectionStatistics {
      * upload speed history
      */
     Statistics upload;
-
     /**
      * number of blocks received with the connection
      */
