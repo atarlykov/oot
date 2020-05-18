@@ -12,12 +12,14 @@ import java.util.BitSet;
  */
 public class PeerProtocol {
 
+    // debug switch
+    private static final boolean DEBUG = true;
+
     /**
      * fixed identification of the protocol, fixed by the specification,
      * length is 19 bytes
      */
     public static final byte[] PROTOCOL_ID = "BitTorrent protocol".getBytes(StandardCharsets.UTF_8);
-
 
     /**
      * processes fully received handshake message in the buffer, position is moved to "after message"
@@ -72,7 +74,7 @@ public class PeerProtocol {
         // empty ending bits couldn't be omitted
         int bytes = (pieces + 7) >> 3;
         if (length != bytes) {
-            assert false: "BITFIELD message with incorrect length";
+            if (DEBUG) System.out.println("BITFIELD message with incorrect length");
             return false;
         }
 
@@ -91,7 +93,7 @@ public class PeerProtocol {
                     mask.set(bitIndex++, isBitSet);
                 }
                 else if (isBitSet) {
-                    assert false: "BITFIELD message contains incorrect bit set";
+                    if (DEBUG) System.out.println("BITFIELD message contains incorrect bit set");
                     // this could be used as the reason to drop the connection,
                     // ignore for now
                     // return false;
@@ -116,7 +118,7 @@ public class PeerProtocol {
      */
     static boolean processPort(Torrent torrent, PeerConnection pc, ByteBuffer buffer, int length) {
         if (length != 2) {
-            assert false: "PORT message with incorrect length";
+            if (DEBUG) System.out.println("PORT message with incorrect length");
             return false;
         }
 
@@ -137,7 +139,7 @@ public class PeerProtocol {
      */
     static boolean processHave(Torrent torrent, PeerConnection pc, ByteBuffer buffer, int length) {
         if (length != 4) {
-            assert false: "HAVE message with incorrect length";
+            if (DEBUG) System.out.println("HAVE message with incorrect length");
             return false;
         }
 
@@ -158,7 +160,7 @@ public class PeerProtocol {
      */
     static boolean processRequest(Torrent torrent, PeerConnection pc, ByteBuffer buffer, int length) {
         if (length != 12) {
-            assert false: "REQUEST message with incorrect length";
+            if (DEBUG) System.out.println("REQUEST message with incorrect length");
             return false;
         }
         int index = buffer.getInt();
@@ -213,7 +215,7 @@ public class PeerProtocol {
 
         // check if notified party has correctly read the data
         if ((position + length - 8) != buffer.position()) {
-            assert false: "pc.onPiece() hasn't read all data from the buffer";
+            if (DEBUG) System.out.println("pc.onPiece() hasn't read all data from the buffer");
             // recover correct position
             buffer.position(position + length - 8);
         }
@@ -251,7 +253,7 @@ public class PeerProtocol {
             case PeerMessage.CHOKE:
             case PeerMessage.UNCHOKE:
                 if (length != 0) {
-                    assert false: "processMessage: choke/unchoke incorrect length";
+                    if (DEBUG) System.out.println("processMessage: choke/unchoke incorrect length");
                     return false;
                 }
                 pc.onChoke(type == PeerMessage.CHOKE);
@@ -260,7 +262,7 @@ public class PeerProtocol {
             case PeerMessage.INTERESTED:
             case PeerMessage.NOT_INTERESTED:
                 if (length != 0) {
-                    assert false: "processMessage: interested/not_interested incorrect length";
+                    if (DEBUG) System.out.println("processMessage: interested/not_interested incorrect length");
                     return false;
                 }
                 pc.onInterested(type == PeerMessage.INTERESTED);
@@ -285,7 +287,7 @@ public class PeerProtocol {
                 return processPort(torrent, pc, buffer, length);
 
             default:
-                assert false: "processMessage: unknown type: " + type;
+                if (DEBUG) System.out.println("processMessage: unknown type: " + type);
                 // skip this message
                 buffer.position(buffer.position() + length - 1);
                 return true;
