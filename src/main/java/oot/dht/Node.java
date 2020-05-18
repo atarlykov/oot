@@ -345,13 +345,17 @@ public class Node {
     }
 
     /**
-     * tries to generate unique id for this node
+     * tries to generate unique id for this node,
      * @return generated id
      */
     private HashId generateUniqueId() {
         try {
+            // this method is usually called only once, so just create random here
             SecureRandom random = SecureRandom.getInstanceStrong();
-            return HashId.wrap(random.generateSeed(HashId.HASH_LENGTH_BYTES));
+            random.reseed();
+            byte[] data = new byte[HashId.HASH_LENGTH_BYTES];
+            random.nextBytes(data);
+            return HashId.wrap(data);
         } catch (NoSuchAlgorithmException e) {
             Random random = new Random();
             random.setSeed(System.nanoTime());
