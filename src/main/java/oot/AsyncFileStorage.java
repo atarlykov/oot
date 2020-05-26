@@ -44,10 +44,8 @@ public class AsyncFileStorage extends Storage {
 
 
         public SimpleFileTorrentStorage(Path _root, Metainfo _metainfo) {
-            metainfo = _metainfo;
+            super(_metainfo, TorrentStorageState.UNKNOWN);
             root = _root;
-            state = TorrentStorageState.UNKNOWN;
-
             files = new TorrentFile[metainfo.files.size()];
             filesEndSizeSums = new long[metainfo.files.size()];
         }
@@ -79,7 +77,7 @@ public class AsyncFileStorage extends Storage {
         }
 
         @Override
-        public void write(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {
+        public void writeBlock(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {
             // make copy to run save operation in parallel
 
             ByteBuffer tmp = getBuffer();
@@ -95,7 +93,7 @@ public class AsyncFileStorage extends Storage {
         }
 
         @Override
-        public void read(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {
+        public void readBlock(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {
             exRead.submit(() -> {
                 boolean result = _read(this, buffer, index, begin, length);
                 if (callback != null) {
@@ -144,6 +142,7 @@ public class AsyncFileStorage extends Storage {
      * @param _blockSize size of blocks/buffers to use
      */
     public AsyncFileStorage(Path _root, boolean _preallocate, int _blockSize) {
+        super(0);
         this.root = _root;
         this.preallocate = _preallocate;
         this.blockSize = _blockSize;
@@ -415,5 +414,15 @@ public class AsyncFileStorage extends Storage {
         }
 
         return true;
+    }
+
+    @Override
+    public void write(String key, byte[] data) {
+
+    }
+
+    @Override
+    public byte[] read(String key) {
+        return new byte[0];
     }
 }

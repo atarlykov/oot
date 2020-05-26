@@ -33,7 +33,7 @@ public class PeerConnection {
      * will be dropped and resent on timeout (to the same or
      * any other peer), milliseconds
      */
-    public static final int DOWNLOAD_QUEUE_REQUESTS_TIMEOUT = 1000;
+    public static final int DOWNLOAD_QUEUE_REQUESTS_TIMEOUT = 16_000;
     /**
      * length of time period to aggregate downloaded and uploaded bytes,
      * in milliseconds
@@ -275,7 +275,11 @@ public class PeerConnection {
      */
     long speedLimitUpload;
 
-
+    /**
+     * allowed constructor
+     * @param _torrent base torrent
+     * @param _peer peer info
+     */
     public PeerConnection(Torrent _torrent, Peer _peer) {
         torrent = _torrent;
         peer = _peer;
@@ -352,26 +356,30 @@ public class PeerConnection {
         // initiate / finish connect
         if (!connected) {
             try {
-                boolean connected = connect();
-                if (connected) {
-                    // send our handshake directly as it doesn't fit into peer message
-                    // and there is always space in send buffer on new connection
-                    sendHandshake();
-
-                    // the 1st message must be bitfield, but only
-                    // in case if we have at least one block
-                    if (0 < torrent.pieces.cardinality()) {
-                        enqueue(torrent.pmCache.bitfield((int)torrent.metainfo.pieces, torrent.pieces));
-                    }
-                    /*
-                    if (client.node != null) {
-                        pc.enqueue(PeerMessage.port(client.node.port));
-                    }
-                    */
-                }
+                connect();
             } catch (IOException e) {
-                if (DEBUG) System.out.println("peer: " + peer.address + "  io exception, setting error [1], " + e.getMessage());
-                peer.setConnectionClosed(true);
+                if (DEBUG) System.out.println("peer: " + peer.address + "  io exception, error [1], " + e.getMessage());
+                peer.setConnectionClosed(Peer.CloseReason.INACCESSIBLE);
+            }
+            if (connected) {
+                // reset error flag if we reuse the connection
+                peer.resetConnectionClosed();
+
+                // send our handshake directly as it doesn't fit into peer message
+                // and there is always space in send buffer on new connection
+                sendHandshake();
+
+                // the 1st message must be bitfield, but only
+                // in case if we have at least one block
+                if (0 < torrent.pieces.cardinality()) {
+                    enqueue(torrent.pmCache.bitfield((int)torrent.metainfo.pieces, torrent.pieces));
+                }
+                /*
+                todo
+                if (client.node != null) {
+                    pc.enqueue(PeerMessage.port(client.node.port));
+                }
+                */
             }
             // connection will be processed on the next turn
             return;
@@ -399,10 +407,8 @@ public class PeerConnection {
 
         // seed mode, decide if we still want to upload
         // to this connection (logic placed in Torrent#onRequest)
-        if (torrent.completed) {
-            if (interested) {
-                enqueue(torrent.pmCache.notInterested());
-            }
+        if (torrent.completed && interested) {
+            enqueue(torrent.pmCache.notInterested());
             return;
         }
 
@@ -424,7 +430,7 @@ public class PeerConnection {
             // remote peer doesn't have pieces we are interested in
             if (!peerInterested) {
                 // other side not interested in us too, disconnect
-                close();
+                close(Peer.CloseReason.NORMAL);
                 return;
             }
 
@@ -565,7 +571,7 @@ public class PeerConnection {
      * cancels selection key to stop receiving notifications
      * and closes the channel, notifies torrent about peer disconnect
      */
-    public void close() {
+    public void close(Peer.CloseReason reason) {
         // notify parent torrent to cancel requests that are
         // enqueued and that have been already sent to the remote peer
         Stream.concat(sendQueue.stream(), blockRequests.stream())
@@ -589,7 +595,7 @@ public class PeerConnection {
         } catch (IOException ignored) {}
 
 
-        peer.setConnectionClosed(true);
+        peer.setConnectionClosed(reason);
         torrent.onPeerDisconnect(this);
     }
 
@@ -605,7 +611,7 @@ public class PeerConnection {
      * - sends prepared data from the send buffer to channel
      * - clears the buffer if everything is sent or compacts if not
      *
-     * on io errors calls {@link PeerConnection#close()} to drop the connection
+     * on io errors calls {@link PeerConnection#close(Peer.CloseReason)} ()} to drop the connection
      * and notify parent torrent
      *
      * buffer state:
@@ -648,8 +654,8 @@ public class PeerConnection {
             }
             return n;
         } catch (IOException e) {
-            if (DEBUG) System.out.println(peer.address + " error [1], " + e.getMessage());
-            close();
+            if (DEBUG) System.out.println("sendPreparedSendBuffer: " + peer.address + "  " + e.getMessage());
+            close(Peer.CloseReason.INACCESSIBLE);
             return 0;
         }
     }
@@ -714,7 +720,7 @@ public class PeerConnection {
                 // this must drop the connection
                 // due to unrecoverable error
                 if (DEBUG) System.out.println(peer.address + " error [2]");
-                close();
+                close(Peer.CloseReason.PROTOCOL_ERROR);
                 return;
             }
 
@@ -854,7 +860,7 @@ public class PeerConnection {
      * called when channel is ready to read data,
      * reads data into the buffer and starts parsing and processing
      * of only fully received messages.
-     * calls {@link PeerConnection#close()} to drop the connection if read or parsing fails
+     * calls {@link PeerConnection#close(Peer.CloseReason)} ()} to drop the connection if read or parsing fails
      */
     private void receive() {
 
@@ -884,16 +890,16 @@ public class PeerConnection {
             n = channel.read(recvBuffer);
         } catch (IOException e) {
             // drop the connection
-            if (DEBUG) System.out.println(peer.address + " error [3], " + e.getMessage());
-            close();
+            if (DEBUG) System.out.println(peer.address + " error receiving data [3], " + e.getMessage());
+            close(Peer.CloseReason.INACCESSIBLE);
             return;
         }
 
         if (n == -1) {
             // end of stream, close connection
             // that could be connection close in case of seed-seed
-            if (DEBUG) System.out.println(peer.address + " error [4]");
-            close();
+            if (DEBUG) System.out.println(peer.address + " closed the connection [4]");
+            close(Peer.CloseReason.NORMAL);
             return;
         }
 
@@ -918,8 +924,8 @@ public class PeerConnection {
                 // enough data, parse handshake
                 boolean correct = PeerProtocol.processHandshake(torrent, this, rb);
                 if (!correct) {
-                    System.out.println(peer.address + " error [5]");
-                    close();
+                    if (DEBUG) System.out.println(peer.address + " error parsing handshake [5]");
+                    close(Peer.CloseReason.PROTOCOL_ERROR);
                     return;
                 }
             }
@@ -965,8 +971,8 @@ public class PeerConnection {
             boolean correct = PeerProtocol.processMessage(torrent, this, rb, len);
             rb.limit(limit);
             if (!correct) {
-                System.out.println(peer.address + " error [6]");
-                close();
+                System.out.println(peer.address + " error parsing p2p protocol message [6]");
+                close(Peer.CloseReason.PROTOCOL_ERROR);
                 return;
             }
             // reset extended mode if active
@@ -1025,10 +1031,12 @@ public class PeerConnection {
      * @param torrentId id of the torrent requested
      * @param peerId peer identifier
      */
-    void onHandshake(byte[] reserved, HashId torrentId, HashId peerId) {
-        handshaked = true;
+    void onHandshake(byte[] reserved, HashId torrentId, HashId peerId)
+    {
         timeHandshaked = System.currentTimeMillis();
-        if (DEBUG) System.out.println(peer.address + "  handshaked");
+        handshaked = true;
+        peer.peerId = peerId;
+        peer.reserved = reserved;
     }
 
     /**
@@ -1088,7 +1096,7 @@ public class PeerConnection {
         boolean correct = torrent.validateBlock(index, begin, length);
         if (!correct) {
             // drop the connection
-            close();
+            close(Peer.CloseReason.PROTOCOL_ERROR);
             return;
         }
 
@@ -1107,10 +1115,13 @@ public class PeerConnection {
             }
         }
 
-        // add another request for this peer,
-        // could be add by #update on the next turn,
-        // but this could send request on this IO turn
-        enqueueBlockRequests();
+        // todo: move logic to torrent ?
+        if (!torrent.completed && (torrent.state == Torrent.State.ACTIVE)) {
+            // add another request for this peer,
+            // could be add by #update on the next turn,
+            // but this could send request on this IO turn
+            enqueueBlockRequests();
+        }
 
         // notify torrent to read & process the data
         torrent.onPiece(this, buffer, index, begin, length);
@@ -1124,7 +1135,7 @@ public class PeerConnection {
      */
     void onChoke(boolean state) {
         peerChoke = state;
-        if (DEBUG) System.out.println(peer.address + " choke: " + state);
+        if (DEBUG) System.out.println(peer.address + " onChoke: " + state);
 
         if (peerChoke) {
             // remove all enqueued requests as they will be dropped by the remote peer
@@ -1161,7 +1172,7 @@ public class PeerConnection {
         // validate common block parameters
         boolean correct = torrent.validateBlock(index, begin, length);
         if (!correct) {
-            close();
+            close(Peer.CloseReason.PROTOCOL_ERROR);
             return;
         }
 
@@ -1229,7 +1240,7 @@ public class PeerConnection {
         // in correct piece we must have correct block #0
         boolean correct = torrent.validateBlock(index, 0, 0);
         if (!correct) {
-            close();
+            close(Peer.CloseReason.PROTOCOL_ERROR);
             return;
         }
 
@@ -1245,16 +1256,21 @@ public class PeerConnection {
     {
         // BITFIELD only allowed once
         if (bitfieldReceived) {
-            close();
+            if (DEBUG) System.out.println(peer.address + " second bitfield message received, dropping the connection");
+            close(Peer.CloseReason.PROTOCOL_ERROR);
             return;
         }
 
         peerPieces.clear();
         peerPieces.or(mask);
+
+        // update linked peer with completion status
+        if (peerPieces.cardinality() == torrent.getMetainfo().pieces) {
+            peer.setCompleted(true);
+        }
+
         bitfieldReceived = true;
     }
-
-
 
 
     public PeerConnectionStatistics getStatistics() {

@@ -5,6 +5,7 @@ import oot.be.Metainfo;
 import java.nio.ByteBuffer;
 import java.util.BitSet;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 /**
@@ -121,8 +122,10 @@ public abstract class Storage {
          * reads state of the torrent into the specified structures
          * @param pieces will be populated with pieces state
          * @param active will be populated with active pieces state
+         * @param callback callback to be notified with true if state was successfully restored and
+         *                 false if it's missing or there were some errors
          */
-        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {}
+        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active, Consumer<Boolean> callback) {}
 
         /**
          * this could be used to limit number of ingoing requests and/or send choke commands

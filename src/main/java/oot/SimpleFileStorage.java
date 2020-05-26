@@ -111,8 +111,8 @@ public class SimpleFileStorage extends Storage {
         }
 
         @Override
-        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
-            SimpleFileStorage.this.readState(metainfo, pieces, active);
+        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active, Consumer<Boolean> callback) {
+            SimpleFileStorage.this.readState(metainfo, pieces, active, callback);
         }
     }
 
@@ -468,10 +468,13 @@ public class SimpleFileStorage extends Storage {
         }
     }
 
-    private void readState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
+    private void readState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active, Consumer<Boolean> callback) {
         try {
             Path path = root.resolve("state/" + metainfo.getInfohash().toString());
             if (!Files.exists(path)) {
+                if (callback != null) {
+                    callback.accept(false);
+                }
                 return;
             }
 
@@ -489,8 +492,15 @@ public class SimpleFileStorage extends Storage {
                 b.active.clear();
                 active.put(p, b);
             });
+
+            if (callback != null) {
+                callback.accept(true);
+            }
+
         } catch (Exception e) {
-            e.printStackTrace();
+            if (callback != null) {
+                callback.accept(false);
+            }
         }
     }
 

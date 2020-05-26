@@ -4,9 +4,15 @@ import oot.be.BEParser;
 import oot.be.BEValue;
 import oot.dht.HashId;
 
+import java.io.IOException;
 import java.net.*;
+import java.net.http.HttpClient;
 import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
+import java.nio.channels.Selector;
 import java.util.*;
+import java.util.concurrent.Future;
+import java.util.function.Consumer;
 
 /**
  * handles trackers linked to a torrent (bep0003),
@@ -33,12 +39,65 @@ public class Tracker {
      */
     int urlIndex;
 
-
     /**
      * time of last announce and scrape requests
      */
     long timeLastAnnounce;
     long timeLastScrape;
+
+    /**
+     * interval as returned by active tracker from the list,
+     * zero if undefined
+     */
+    int interval;
+    int leechers;
+    int seeders;
+
+    /**
+     * last connection id received from a tracker (udp mode)
+     */
+    long udpConnectionId;
+    /**
+     * timestamp of the last connection id received
+     */
+    long udpConnectionTime;
+    /**
+     *
+     */
+    InetSocketAddress udpAddress;
+
+    /**
+     * indicates that this instance is being processed
+     * at the moment, need to restrict double submissions
+     */
+    volatile boolean updating;
+
+    // retransmission 15*2**n  0..8 + re-request cId
+
+
+    String getCurrentUrl() {
+        return urls.get(urlIndex);
+    }
+
+    // todo synch
+    void switchToNextUrl() {
+        urlIndex = (urlIndex + 1) % urls.size();
+        interval = 0;
+    }
+
+    /*
+       1. connect (tx)
+       2. announce (tx)
+       3. scrape
+
+     */
+    void x() {
+        HttpClient client = HttpClient.newHttpClient();
+        //client.sendAsync()
+
+
+        //HttpClient.newBuilder().executor();
+    }
 
 
     public Tracker(Torrent _torrent, List<String> _urls) {
@@ -54,45 +113,27 @@ public class Tracker {
         urlIndex = 0;
     }
 
-
-    /**
-     * must be called periodically to perform tracker update,
-     * internally controls update period to be not less than TIMEOUT_ANNOUNCE
-     * updates and run in background in service threads controlled by Client
-     */
-    void update() {
-        long now = System.currentTimeMillis();
-        if (TIMEOUT_ANNOUNCE < now - timeLastAnnounce) {
-            torrent.getClient().executor.submit((Runnable) this::announce);
-            timeLastAnnounce = now;
-        }
-
-        if (TIMEOUT_SCRAPE < now - timeLastScrape) {
-            timeLastScrape = now;
-        }
-    }
-
     /**
      * perform announce call to this tracker
      */
     private void announce()
     {
-        String url = urls.get(urlIndex);
-        if (url.startsWith("http://") || url.startsWith("https://")) {
-            try {
-
-                String query = buildAnnounceUrl(
-                        torrent.getClient().id, 0, torrent.metainfo.getInfohash(), url,
-                        /*torrent.downloaded, torrent.uploaded, torrent.left*/
-                        0, 0, torrent.metainfo.length);
-                BEValue beValue = announce(query);
-                Set<Peer> peers = parseAnnounceResponse(beValue);
-                torrent.addPeers(peers);
-            } catch (Exception e) {
-                System.out.println(e.getMessage());
-                urlIndex = (urlIndex + 1) % urls.size();
-            }
-        }
+//        String url = urls.get(urlIndex);
+//        if (url.startsWith("http://") || url.startsWith("https://")) {
+//            try {
+//
+//                String query = buildAnnounceUrl(
+//                        torrent.getClient().id, 0, torrent.metainfo.getInfohash(), url,
+//                        /*torrent.downloaded, torrent.uploaded, torrent.left*/
+//                        0, 0, torrent.metainfo.length);
+//                BEValue beValue = announce(query);
+//                Set<Peer> peers = parseAnnounceResponse(beValue);
+//                torrent.addPeers(peers);
+//            } catch (Exception e) {
+//                System.out.println(e.getMessage());
+//                urlIndex = (urlIndex + 1) % urls.size();
+//            }
+//        }
 
 
         /*
@@ -149,109 +190,12 @@ public class Tracker {
         return query.toString();
     }
 
-    /**
-     * performs blocking request to the specified url and
-     * parses server response into BE representation
-     * @param query url to query
-     * @return parsed server's response
-     * @throws Exception on any IO error
-     */
-    private static BEValue announce(String query)
-            throws Exception
+    String buildAnnounceUrl(String url)
     {
-        System.out.println(query);
-        URL url = new URL(query);
-
-        URLConnection urlConnection = url.openConnection();
-        urlConnection.setConnectTimeout(5000);
-        urlConnection.connect();
-
-        System.out.println("response code: " + ((HttpURLConnection)urlConnection).getResponseCode());
-
-        if (((HttpURLConnection)urlConnection).getResponseCode() != 200) {
-            return null;
-        }
-        //((HttpURLConnection)urlConnection).getResponseMessage();
-
-        byte[] data = urlConnection.getInputStream().readAllBytes();
-        ByteBuffer b = ByteBuffer.wrap(data);
-        BEParser parser = new BEParser();
-        BEValue response = parser.parse(b);
-        return response;
+        return buildAnnounceUrl(
+                torrent.getClient().id, 0, torrent.metainfo.getInfohash(), url,
+                /*torrent.downloaded, torrent.uploaded, torrent.left*/
+                0, 0, torrent.metainfo.length);
     }
-
-    /**
-     * parses tracker response as sent as answer to announce request
-     * @param data parsed binary encoded representation
-     * @return not null set with unique peers
-     */
-    public Set<Peer> parseAnnounceResponse(BEValue data)
-    {
-        if ((data == null) || !data.isDict() || !data.isDictNotEmpty()) {
-            return Collections.emptySet();
-        }
-        BEValue beReason = data.dictionary.get("failure reason");
-        if (beReason != null) {
-            String reason = beReason.getBStringAsString();
-            return Collections.emptySet();
-        }
-
-        // todo: support later
-        //data.dictionary.get("interval");
-
-        Set<Peer> result = new HashSet<>();
-
-        BEValue peers = data.dictionary.get("peers");
-        if (BEValue.isList(peers)) {
-            // bep0003, this is list of dictionaries: [{peer id, ip, port}]
-            for (int i = 0; i < peers.list.size(); i++) {
-                BEValue bePeer = peers.list.get(i);
-                if (!BEValue.isDict(bePeer)) {
-                    continue;
-                }
-                BEValue peer_id = bePeer.dictionary.get("peer id");
-                BEValue ip = bePeer.dictionary.get("ip");
-                BEValue port = bePeer.dictionary.get("port");
-
-                if (BEValue.isBString(ip) && BEValue.isBString(port)) {
-                    try {
-                        InetSocketAddress isa = new InetSocketAddress(
-                                Inet4Address.getByName(ip.getBStringAsString()),
-                                Integer.parseInt(port.getBStringAsString())
-                        );
-                        Peer peer = new Peer(isa);
-                        result.add(peer);
-                    } catch (UnknownHostException ignore) {
-                    }
-                }
-            }
-            return result;
-        }
-
-        if (BEValue.isBString(peers)) {
-            // bep0023 compact representation ipv4 addressed "4+2|.."
-            byte[] tmp = new byte[4];
-            for (int i = 0; i < peers.bString.length / 6; i++) {
-                try {
-                    tmp[0] = peers.bString[i*6 + 0];
-                    tmp[1] = peers.bString[i*6 + 1];
-                    tmp[2] = peers.bString[i*6 + 2];
-                    tmp[3] = peers.bString[i*6 + 3];
-
-                    int port = (Byte.toUnsignedInt(peers.bString[i*6 + 4]) << 8)
-                            | Byte.toUnsignedInt(peers.bString[i*6 + 5]);
-
-                    InetSocketAddress isa = new InetSocketAddress( Inet4Address.getByAddress(tmp), port);
-                    Peer peer = new Peer(isa);
-                    result.add(peer);
-                } catch (UnknownHostException ignored) {
-                }
-            }
-            return result;
-        }
-
-        return Collections.emptySet();
-    }
-
 
 }

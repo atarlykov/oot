@@ -1,13 +1,21 @@
 package oot;
 
 import oot.be.Metainfo;
+import oot.dht.HashId;
 
 import java.io.Serializable;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.Selector;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
-public class Torrent {
+public class Torrent
+{
+    // debug switch
+    private static final boolean DEBUG = true;
 
     /**
      * internal states of each torrent
@@ -17,26 +25,21 @@ public class Torrent {
          * state is unknown, usually after creation of a new torrent,
          * must to load state, checks files, bind file channels, etc.
          */
-        UNKNOWN,
+        NEW,
         /**
          * initialization is in progress, querying trackers, binding to files,
          * checking state, etc.
          */
         INITIALIZING,
         /**
-         * initialization finished, could perform some action
-         * on the main thread
-         */
-        INITIALIZED,
-        /**
          * torrent is downloading, seeding, etc.
          */
         ACTIVE,
         /**
-         * opened connections could stay, keep alive sent
-         * todo: review
+         * waiting for all active requests to finish,
+         * then will switch to STOPPED
          */
-        PAUSED,
+        STOPPING,
         /**
          * bind to files, all information is known, could updated with
          * new peers from dht, etc.
@@ -46,18 +49,22 @@ public class Torrent {
         /**
          * something is wrong
          */
-        ERROR
+        ERROR,
     }
 
     /**
      * max number of opened connections while downloading
      * the torrent
      */
-    public static final int CONNECTIONS_MAX_DOWNLOAD = 4;
+    public static final int CONNECTIONS_DOWNLOAD_MAX = 16;
     /**
      * max number of connection is seed mode
      */
-    public static final int CONNECTIONS_MAX_SEED = 2;
+    public static final int CONNECTIONS_SEED_MAX = 2;
+    /**
+     * timeout to start dropping extra connections after switching to seed mode
+     */
+    public static final long CONNECTIONS_SEED_DROP_TIMEOUT = 5000L;
 
     /**
      * Size of blocks requested from remote peers,
@@ -77,6 +84,14 @@ public class Torrent {
      * used only for uncompleted torrents
      */
     public static final long TORRENT_STATE_SAVE_TIMEOUT = 10_000;
+    /**
+     * period to re-request peers from DHT
+     */
+    public static final long TORRENT_PEERS_DHT_UPDATE_TIMEOUT = 900_000;
+    /**
+     * period to send announce to trackers during download
+     */
+    public static final long TORRENT_PEERS_TRACKERS_UPDATE_TIMEOUT = 900_000;
 
     /**
      * ref to parent client that controls all the torrents,
@@ -122,7 +137,7 @@ public class Torrent {
      * state of pieces available on our size,
      * includes only pieces we have fully downloaded
      */
-    private final BitSet pieces;
+    final BitSet pieces;
 
     /**
      * timestamp of the last state save
@@ -137,9 +152,28 @@ public class Torrent {
      */
     long timeLastDump = 0;
     /**
-     * debug time of the torrent initialization
+     * timestamp of the torrent initialization/(re)start
      */
-    long timeTorrentStart = 0;
+    long timeTorrentStarted = 0;
+    /**
+     * timestamp of the torrent's finished event
+     */
+    long timeTorrentCompleted = 0;
+    /**
+     * timestamp of the last search for peers via DHT
+     */
+    long timeLastDHTUpdate = 0;
+
+    /**
+     * number of data bytes (as blocks) downloaded
+     */
+    AtomicLong downloaded = new AtomicLong();
+
+    /**
+     * number of data bytes (as blocks) uploaded
+     */
+    AtomicLong uploaded = new AtomicLong();
+
 
 
     /**
@@ -237,7 +271,7 @@ public class Torrent {
         client = _client;
         metainfo = _metainfo;
         pieceBlocks = (int)(metainfo.pieceLength >> BLOCK_LENGTH_BITS);
-        state = State.UNKNOWN;
+        state = State.NEW;
         pieces = new BitSet((int)metainfo.pieces);
 
         trackers = new ArrayList<>();
@@ -352,11 +386,12 @@ public class Torrent {
      * @param piece piece index
      * @param block block index (in blocks, not bytes)
      */
-    private void markBlockDownloaded(int piece, int block) {
+    private void markBlockDownloaded(int piece, int block)
+    {
         synchronized (piecesConfigurationLock) {
             PieceBlocks pb = piecesActive.get(piece);
             if (pb == null) {
-                System.out.println("[MBLKD] p:" + piece + " b:" + block);
+                if (DEBUG) System.out.println("[MBLKD] p:" + piece + " b:" + block);
                 return;
             }
             pb.ready.set(block);
@@ -403,11 +438,12 @@ public class Torrent {
      * calls {@link Torrent#onFinished()} if it was the last piece to be downloaded
      * @param piece piece index
      */
-    private void markPieceDownloaded(int piece) {
+    private void markPieceDownloaded(int piece)
+    {
         synchronized (piecesConfigurationLock) {
             PieceBlocks pb = piecesActive.remove(piece);
             if (pb == null) {
-                System.out.println("[MPD1]");
+                if (DEBUG) System.out.println("[MPD1]");
             } else {
                 releasePieceBlocks(pb);
             }
@@ -635,35 +671,61 @@ public class Torrent {
     }
 
     /**
+     * tries to find new peers for this torrent via DHT if available
+     * @param now timestamp
+     */
+    void getMorePeersFromDht(long now)
+    {
+        if (client.isDhtEnabled()) {
+            if (timeLastDHTUpdate + TORRENT_PEERS_DHT_UPDATE_TIMEOUT < now)
+            {
+                timeLastDHTUpdate = now;
+                client.node.findPeers(metainfo.getInfohash(), this::addPeersFromAddresses);
+            }
+        }
+    }
+
+
+    /**
      * this method is called periodically by client to update state,
      * open/close new connections, send keep alive messages,
      * perform some maintenance, etc.
      */
     void update()
     {
-        long timeLastUpdate = System.currentTimeMillis();
+        long now = System.currentTimeMillis();
+        timeLastUpdate = now;
 
-        if (state == State.UNKNOWN) {
+        if (state == State.NEW)
+        {
+            timeTorrentStarted = now;
+
+            client.trackersManager.announce(this, TrackersManager.AnnounceEvent.STARTED);
+            getMorePeersFromDht(now);
+
             state = State.INITIALIZING;
-            storage.init(result -> {
-                if (!result) {
-                    state = State.ERROR;
+            restoreState(b -> {
+                if (b) {
+                    state = State.ACTIVE;
                 } else {
-                    state = State.INITIALIZED;
+                    storage.init(result -> {
+                        if (!result) {
+                            state = State.ERROR;
+                        } else {
+                            state = State.ACTIVE;
+                        }
+                    });
                 }
             });
-            return;
         }
 
-        if (state == State.INITIALIZED) {
-            restoreState();
-            timeTorrentStart = timeLastUpdate;
-            state = State.ACTIVE;
-        }
-
-        if (state == State.ACTIVE) {
+        if (state == State.ACTIVE)
+        {
             updateConnections();
-            updateTrackers();
+
+            getMorePeersFromDht(now);
+
+            // todo re-announce?
 
             if (!completed && (TORRENT_STATE_SAVE_TIMEOUT < timeLastUpdate - timeLastStateSave)) {
                 saveState();
@@ -671,25 +733,41 @@ public class Torrent {
             }
         }
 
+        if (state == State.STOPPING) {
+            // ?timeout?
+            boolean stopped = true;
+            for (Map.Entry<Peer, PeerConnection> entry: connections.entrySet()) {
+                PeerConnection pc = entry.getValue();
+                if (pc.getActiveBlockRequestsNumber() <= 0) {
+                    pc.close(Peer.CloseReason.NORMAL);
+                } else {
+                    stopped = false;
+                    break;
+                }
+            }
+            if (stopped) {
+                // force close & remove connections
+                connections.values().forEach(pc -> pc.close(Peer.CloseReason.NORMAL));
+                connections.keySet().removeIf(Peer::isConnectionClosed);
+
+                // notify trackers
+                client.trackersManager.announce(this, TrackersManager.AnnounceEvent.STOPPED);
+
+                state = State.STOPPED;
+            }
+        }
+
         // merge peers collections
         moveNewPeersToMainCollection();
     }
 
-    /**
-     * periodically connects to trackers to receive
-     * new collections of peers and notify them
-     * about out status
-     */
-    private void updateTrackers() {
-        for (Tracker t: trackers) {
-            t.update();
-        }
-    }
 
     /**
      * performs logic linked to all connections..
      */
-    private void updateConnections() {
+    private void updateConnections()
+    {
+        long now = System.currentTimeMillis();
 
         // remove connections that were not able to finish
         // connecting phase or were disconnected while
@@ -700,45 +778,96 @@ public class Torrent {
 
         // number of connections we may open
         int toOpen = 0;
-        if (completed) {
-            if (CONNECTIONS_MAX_SEED < connections.size()) {
-                // it's possible we've just stopped download
-                // and need to decrease connections
-                //closeSlowestConnections(CONNECTIONS_MAX_SEED - connections.size());
+        if (completed)
+        {
+            if ((CONNECTIONS_SEED_MAX < connections.size())
+                    && (timeTorrentCompleted + CONNECTIONS_SEED_DROP_TIMEOUT < now))
+            {
+                // we have completed torrent here and too many active connections,
+                // seed-seed connections should be already dropped via updateConnection()
+                // due to CONNECTIONS_SEED_DROP_TIMEOUT timeout
+                closeConnections(CONNECTIONS_SEED_MAX);
             }
-            toOpen = CONNECTIONS_MAX_SEED - connections.size();
+            // some connection could have finished downloading from us,
+            // try to open connections to another peers (private ip mode)
+            toOpen = CONNECTIONS_SEED_MAX - connections.size();
         } else {
-            toOpen = CONNECTIONS_MAX_DOWNLOAD - connections.size();
+            toOpen = CONNECTIONS_DOWNLOAD_MAX - connections.size();
         }
+
         while (0 < toOpen--) {
             openConnection();
         }
 
-
+        // let each connection to update itself - connect, etc.
         connections.forEach((peer, pc) -> pc.updateConnection());
     }
+
+    /**
+     * closes extra connections choosing ones with the slowest upload rate
+     * @param allowed number of connections to leave be
+     */
+    private void closeConnections(int allowed)
+    {
+        // force close seed-seed connections (must be closed already),
+        // [could check interested/peerInterested flags]
+        connections.entrySet().removeIf(entry -> {
+            PeerConnection pc = entry.getValue();
+            boolean interesting = this.hasMissingPieces(pc);
+            if (!interesting) {
+                if (DEBUG) System.out.println(pc.peer.address + " forced close of s2s connection");
+                pc.close(Peer.CloseReason.NORMAL);
+                return true;
+            }
+            return false;
+        });
+
+        if (connections.size() <= allowed) {
+            return;
+        }
+
+        // make stable copy of connections and remove the slowest ones
+        PeerConnection[] pcs = connections.values().toArray(PeerConnection[]::new);
+        long[] speeds = Arrays.stream(pcs).mapToLong(pc -> pc.getUploadSpeed(2)).toArray();
+        long[] sorted = Arrays.stream(speeds).sorted().toArray();
+        long bound = sorted[sorted.length - allowed - 1];
+        for (int i = 0; i < pcs.length; i++) {
+            PeerConnection pc = pcs[i];
+            if (speeds[i] <= bound) {
+                pc.close(Peer.CloseReason.NORMAL);
+                connections.remove(pc.peer);
+            }
+        }
+    }
+
 
     /**
      * finds another peer in the list of available ones
      * and tries to open connection to it,
      * on success registers new connection in {@link Torrent#connections}
      */
-    private void openConnection() {
+    private void openConnection()
+    {
         for (Peer peer : peers) {
             if (connections.containsKey(peer)) {
+                // already connected or connecting
                 continue;
             }
             if (!peer.isConnectionAllowed()) {
+                // still waiting for reconnect to be allowed
                 continue;
             }
+            if (completed && peer.isCompleted()) {
+                // seed mode and peer already has all the pieces,
+                // nobody needs this connection
+                continue;
+            }
+
             // remove error state as it's possible we are going to reconnect
-            peer.setConnectionClosed(false);
+            peer.resetConnectionClosed();
             PeerConnection pc = new PeerConnection(this, peer);
             connections.put(peer, pc);
-
             setDownloadSpeedLimit(speedLimitDownload);
-
-            System.out.println("peer: " + peer.address + "  connection initiated");
             break;
         }
     }
@@ -793,6 +922,22 @@ public class Torrent {
     }
 
     /**
+     * external api method to add new peers to the torrent
+     * @param newPeers collection of peers' addresses
+     */
+    public void addPeersFromAddresses(Collection<InetSocketAddress> newPeers) {
+        if (newPeers == null) {
+            return;
+        }
+        synchronized (peersSyncAdd) {
+            for (InetSocketAddress isa: newPeers) {
+                Peer peer = new Peer(isa);
+                peersSyncAdd.add(peer);
+            }
+        }
+    }
+
+    /**
      * internal method to be called on the thread that processes the torrent,
      * moves all new peer from peersSyncAdd collection to the main one,
      * should be called on state update
@@ -818,12 +963,14 @@ public class Torrent {
      */
     void onFinished()
     {
-        System.out.println("FINISHED");
         completed = true;
+        timeTorrentCompleted = System.currentTimeMillis();
         saveState();
 
-        long time = System.currentTimeMillis() - timeTorrentStart;
-        System.out.println("time: " + ((double)time)/1000 + "s");
+        if (DEBUG) {
+            long time = timeTorrentCompleted - timeTorrentStarted;
+            System.out.println(String.format("finished downloading: %s  time: %d sec",  metainfo.getInfohash().toString(), time/1000));
+        }
     }
 
 
@@ -835,11 +982,15 @@ public class Torrent {
      * @param begin block position inside the piece
      * @param length length of the block, must be == buffer.remaining()
      */
-    void onPiece(PeerConnection pc, ByteBuffer buffer, int index, int begin, int length) {
+    void onPiece(PeerConnection pc, ByteBuffer buffer, int index, int begin, int length)
+    {
+        if (DEBUG) System.out.println("onPiece: " + index + "  " + (begin >> 14));
+
         storage.writeBlock(buffer, index, begin, length, (result) -> {
             // this could be called from some other thread (storage)
             int block = begin >> BLOCK_LENGTH_BITS;
             markBlockDownloaded(index, block);
+            downloaded.addAndGet(Torrent.BLOCK_LENGTH);
         });
     }
 
@@ -859,6 +1010,7 @@ public class Torrent {
         storage.readBlock(buffer, index, begin, length, result -> {
             PeerMessage pm = pmCache.piece(index, begin, length, buffer);
             pc.enqueue(pm);
+            uploaded.addAndGet(Torrent.BLOCK_LENGTH);
         });
     }
 
@@ -868,8 +1020,8 @@ public class Torrent {
      */
     void onPeerDisconnect(PeerConnection pc) {
         // peer will be removed in update()
-        System.out.println(pc.peer.address + " error / disconnected");
-        new Exception().printStackTrace();
+        //System.out.println(pc.peer.address + " error / disconnected");
+        //new Exception().printStackTrace();
     }
 
     /**
@@ -899,9 +1051,11 @@ public class Torrent {
 
     /**
      * restores state loading it from the storage
+     * @param callback callback to be notified with true if state was successfully restored and
+     *                 false if it's missing or there were some errors
      */
-    private void restoreState() {
-        storage.readState(pieces, piecesActive);
+    private void restoreState(Consumer<Boolean> callback) {
+        storage.readState(pieces, piecesActive, callback);
         completed = pieces.cardinality() == metainfo.pieces;
     }
 
@@ -986,12 +1140,14 @@ public class Torrent {
         }
 
         // divide not used throughput equally between quick connections
-        index = 0;
-        long averageSpeedBudget = availableSpeedBudget / hightSpeedCount;
-        for (PeerConnection pc : pcs) {
-            long speed = speeds[index++];
-            if (averageSpeedLimit - Torrent.BLOCK_LENGTH <= speed) {
-                pc.speedLimitDownload = speed + averageSpeedBudget;
+        if (0 < hightSpeedCount) {
+            index = 0;
+            long averageSpeedBudget = availableSpeedBudget / hightSpeedCount;
+            for (PeerConnection pc : pcs) {
+                long speed = speeds[index++];
+                if (averageSpeedLimit - Torrent.BLOCK_LENGTH <= speed) {
+                    pc.speedLimitDownload = speed + averageSpeedBudget;
+                }
             }
         }
     }
@@ -1004,7 +1160,7 @@ public class Torrent {
     {
         Formatter formatter = new Formatter();
         formatter.format("                              L  P                                 \n");
-        formatter.format("                          C H CI CI  DLR RQ   BLKS |  UPL  Q   BLKS\n");
+        formatter.format("                          C H CI CI   DLR  RQ   BLKS |   UPL  Q   BLKS\n");
 
         connections.forEach((peer, pc) -> {
             PeerConnectionStatistics s = pc.statistics;
@@ -1014,7 +1170,7 @@ public class Torrent {
             double urate = s.upload.average(4);
             urate /= 1024*1024;
 
-            formatter.format("%24s %2S%2S %1c%1c %1c%1c %4.1f %2d %6d | %4.1f %2d %6d\n",
+            formatter.format("%24s %2S%2S %1c%1c %1c%1c %5.1f %3d %6d | %5.1f %2d %6d  %s\n",
                     peer.address,
                     pc.connected ? "+" : "-",
                     pc.handshaked ? "+" : "-",
@@ -1025,13 +1181,182 @@ public class Torrent {
                     pc.peerInterested ? 'i' : '-',
 
                     drate, pc.blockRequests.size(), s.blocksReceived,
-                    urate, 0, s.blocksSent);
+                    urate, 0, s.blocksSent,
+                    (peer.peerId != null) ? decodePeerClient(peer.peerId) : "");
         });
         formatter.format(" peer messages created: %d\n", PeerMessageCache.counter);
         formatter.format("     buffers allocated: %d\n", SimpleFileStorage.buffersAllocated);
         formatter.format("                 state: %s\n", state.name());
+        formatter.format("            completion: %.2f\n", 100.0 * pieces.cardinality() / metainfo.pieces);
+        formatter.format("                 peers: %d\n", peers.size());
         //formatter.format("       save task queue: %d\n", SimpleFileStorage.exSave.getQueue().size());
 
         System.out.println(formatter.toString());
     }
+
+    public static String decodePeerClient(HashId id)
+    {
+        byte[] data = id.getBytes();
+        if (data[0] == 'M') {
+            StringBuilder client = new StringBuilder("mainline ");
+            int i = 1;
+            while ((data[i] == '-') || Character.isDigit(data[i])) {
+                client.append(data[i] & 0xFF);
+            }
+            return client.toString();
+        }
+
+        if ((data[0] == 'e') && (data[1] == 'x') && (data[2] == 'b') && (data[3] == 'c')) {
+            return "BitComet " + (data[4] & 0xFF) + "." + (data[5] & 0xFF);
+        }
+
+        if ((data[0] == 'X') && (data[1] == 'B') && (data[2] == 'T')) {
+            return "XBT " + (data[3] & 0xFF) + "." + (data[4] & 0xFF) + "." + (data[5] & 0xFF) + (data[6] == 'd' ? " debug" : "");
+        }
+
+        if ((data[0] == 'O') && (data[1] == 'P')) {
+            return "Opera " + (data[2] & 0xFF) + "." + (data[3] & 0xFF) + "." + (data[4] & 0xFF) + "." + (data[5] & 0xFF);
+        }
+
+        if ((data[0] == '-') && (data[1] == 'M') && (data[2] == 'L')) {
+            // -ML2.7.2-
+            return "MLdonkey " + decodePeerAsciiTail(data, 3);
+        }
+
+        if ((data[0] == '-') && (data[1] == 'B') && (data[2] == 'O') && (data[3] == 'W')) {
+            return "Bits on Wheels" + decodePeerAsciiTail(data, 4);
+        }
+
+        //if ((data[0] == 'Q')) {
+        //    return "Queen Bee (?) " + decodePeerAsciiTail(data, 1);
+        //}
+
+        if ((data[0] == '-') && (data[1] == 'F') && (data[2] == 'G')) {
+            return "FlashGet " + decodePeerAsciiTail(data, 3);
+        }
+
+        if (data[0] == 'A') {
+            return "ABC " + decodePeerAsciiTail(data, 1);
+        }
+        if (data[0] == 'O') {
+            return "Osprey Permaseed " + decodePeerAsciiTail(data, 1);
+        }
+        if (data[0] == 'Q') {
+            return "BTQueue or Queen Bee " + decodePeerAsciiTail(data, 1);
+        }
+        if (data[0] == 'R') {
+            return "Tribler " + decodePeerAsciiTail(data, 1);
+        }
+        if (data[0] == 'S') {
+            return "Shadow " + decodePeerAsciiTail(data, 1);
+        }
+        if (data[0] == 'T') {
+            return "BitTornado " + decodePeerAsciiTail(data, 1);
+        }
+        if (data[0] == 'U') {
+            return "UPnP NAT Bit Torrent " + decodePeerAsciiTail(data, 1);
+        }
+
+        if ((data[0] == '-') && (data[7] == '-')) {
+            String code = new String(data, 1, 2, StandardCharsets.UTF_8);
+            StringBuilder client = new StringBuilder();
+            String name = CLIENTS_DASH.get(code);
+            if (name != null) {
+                client.append(name);
+            } else {
+                client.append((char)data[1]).append((char)data[2]);
+            }
+            client.append(' ');
+            client.append(Character.digit(data[3] & 0xFF, 10));
+            client.append('.');
+            client.append(Character.digit(data[4] & 0xFF, 10));
+            client.append('.');
+            client.append(Character.digit(data[5] & 0xFF, 10));
+            client.append('.');
+            client.append(Character.digit(data[6] & 0xFF, 10));
+            return client.toString();
+        }
+
+        return "unknown " + decodePeerAsciiTail(data, 0);
+    }
+
+    public static String decodePeerAsciiTail(byte[] data, int position) {
+        StringBuilder tmp = new StringBuilder();
+        while ((position < data.length)
+                && (0 < data[position])
+                && Character.isLetterOrDigit(data[position] & 0xFF))
+        {
+            tmp.append((char)data[position]);
+        }
+        return tmp.toString();
+    }
+
+    public final static Map<String, String> CLIENTS_DASH = Map.ofEntries(
+            Map.entry("AG", "Ares"),
+            Map.entry("A~", "Ares"),
+            Map.entry("AR", "Arctic"),
+            Map.entry("AV", "Avicora"),
+            Map.entry("AX", "BitPump"),
+            Map.entry("AZ", "Azureus"),
+            Map.entry("BB", "BitBuddy"),
+            Map.entry("BC", "BitComet"),
+            Map.entry("BF", "Bitflu"),
+            Map.entry("BG", "BTG (uses Rasterbar libtorrent)"),
+            Map.entry("BR", "BitRocket"),
+            Map.entry("BS", "BTSlave"),
+            Map.entry("BX", "~Bittorrent X"),
+            Map.entry("CD", "Enhanced CTorrent"),
+            Map.entry("CT", "CTorrent"),
+            Map.entry("DE", "DelugeTorrent"),
+            Map.entry("DP", "Propagate Data Client"),
+            Map.entry("EB", "EBit"),
+            Map.entry("ES", "electric sheep"),
+            Map.entry("FT", "FoxTorrent"),
+            Map.entry("FW", "FrostWire"),
+            Map.entry("FX", "Freebox BitTorrent"),
+            Map.entry("GS", "GSTorrent"),
+            Map.entry("HL", "Halite"),
+            Map.entry("HN", "Hydranode"),
+            Map.entry("KG", "KGet"),
+            Map.entry("KT", "KTorrent"),
+            Map.entry("LH", "LH-ABC"),
+            Map.entry("LP", "Lphant"),
+            Map.entry("LT", "libtorrent"),
+            Map.entry("lt", "libTorrent"),
+            Map.entry("LW", "LimeWire"),
+            Map.entry("MO", "MonoTorrent"),
+            Map.entry("MP", "MooPolice"),
+            Map.entry("MR", "Miro"),
+            Map.entry("MT", "MoonlightTorrent"),
+            Map.entry("NX", "Net Transport"),
+            Map.entry("PD", "Pando"),
+            Map.entry("qB", "qBittorrent"),
+            Map.entry("QD", "QQDownload"),
+            Map.entry("QT", "Qt 4 Torrent example"),
+            Map.entry("RT", "Retriever"),
+            Map.entry("S~", "Shareaza alpha/beta"),
+            Map.entry("SB", "~Swiftbit"),
+            Map.entry("SS", "SwarmScope"),
+            Map.entry("ST", "SymTorrent"),
+            Map.entry("st", "sharktorrent"),
+            Map.entry("SZ", "Shareaza"),
+            Map.entry("TN", "TorrentDotNET"),
+            Map.entry("TR", "Transmission"),
+            Map.entry("TS", "Torrentstorm"),
+            Map.entry("TT", "TuoTu"),
+            Map.entry("UL", "uLeecher!"),
+            Map.entry("UT", "µTorrent"),
+            Map.entry("UW", "µTorrent Web"),
+            Map.entry("VG", "Vagaa"),
+            Map.entry("WD", "WebTorrent Desktop"),
+            Map.entry("WT", "BitLet"),
+            Map.entry("WW", "WebTorrent"),
+            Map.entry("WY", "FireTorrent"),
+            Map.entry("XL", "Xunlei"),
+            Map.entry("XT", "XanTorrent"),
+            Map.entry("XX", "Xtorrent"),
+            Map.entry("ZT", "ZipTorrent"),
+            Map.entry("BD", "BD"),
+            Map.entry("NP", "NP"),
+            Map.entry("wF", "wF"));
 }

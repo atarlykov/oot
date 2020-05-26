@@ -40,6 +40,10 @@ public class Client {
      * timeout to save DHT routing table state to storage
      */
     private static final long DHT_NODE_STATE_SAVE_TIMEOUT = 600_000;
+    /**
+     * key to save DHT state to storage
+     */
+    private static final String DHT_NODE_STATE_SAVE_KEY = "dht";
 
     /**
      * unique 'fixed' identifier of this client
@@ -73,6 +77,15 @@ public class Client {
      * ref to DHT node if available
      */
     Node node;
+    /**
+     * indicates if DHT(Node) is available of not
+     */
+    private boolean dhtEnabled;
+
+    /**
+     * instance of api class to work with trackers
+     */
+    TrackersManager trackersManager;
 
     /**
      * thread that handles client's updates
@@ -119,7 +132,18 @@ public class Client {
      * @param _id unique id of this torrent
      * @param _storage ref to storage
      */
-    public Client(HashId _id, Storage _storage /*, Executors?*/)
+    public Client(HashId _id, Storage _storage)
+    {
+        this(_id, _storage, true);
+    }
+
+    /**
+     * allowed constructor
+     * @param _id unique id of this torrent
+     * @param _storage ref to storage
+     * @param _dhtEnable DHT support
+     */
+    public Client(HashId _id, Storage _storage, boolean _dhtEnable)
     {
         id = _id;
         // set version data due to spec
@@ -127,17 +151,31 @@ public class Client {
 
         storage = _storage;
         torrents = new ArrayList<>();
+        trackersManager = new TrackersManager(this);
+
+        dhtEnabled = _dhtEnable;
+        if (dhtEnabled) {
+            byte[] state = storage.read(DHT_NODE_STATE_SAVE_KEY);
+            if (state != null) {
+                node = new Node(state);
+            } else {
+                node = new Node();
+            }
+        }
     }
 
     /**
-     * allowed constructor
-     * @param _storage ref to storage
+     * @return true if DHT support is active
      */
-    public Client(Storage _storage /*, Executors?*/)
-    {
-        id = generateUniqueId();
-        storage = _storage;
-        torrents = new ArrayList<>();
+    public boolean isDhtEnabled() {
+        return dhtEnabled;
+    }
+
+    /**
+     * @return ref to DHT node
+     */
+    public Node getDhtNode() {
+        return node;
     }
 
     /**
@@ -175,25 +213,45 @@ public class Client {
     }
 
     /**
+     * access outside the client's thread must be synchronized
+     * @return ref to internal torrents collection
+     */
+    public List<Torrent> getTorrents() {
+        return torrents;
+    }
+
+    /**
      * starts client processing inside the dedicated thread
      * @return true if resources were allocated successfully
      */
     public boolean start()
     {
         try {
-            selector = Selector.open();
+            trackersManager.init();
         } catch (IOException e) {
-            if (DEBUG) System.out.println("client start: " + e.getMessage());
+            if (DEBUG) System.out.println("client: error starting trackersManager: " + e.getMessage());
             return false;
         }
 
-        byte[] dhtState = storage.read("dht");
-        if (dhtState != null) {
-            node = new Node(dhtState);
-        } else {
-            node = new Node();
+        try {
+            selector = Selector.open();
+        } catch (IOException e) {
+            if (DEBUG) System.out.println("client: error opening selector: " + e.getMessage());
+            stop();
+            return false;
         }
 
+        if (dhtEnabled) {
+            try {
+                node.start();
+            } catch (IOException e) {
+                if (DEBUG) System.out.println("client: error starting DHT node: " + e.getMessage());
+                stop();
+                return false;
+            }
+        }
+
+        // run main thread
         thread = new ClientThread();
         thread.setDaemon(true);
         thread.start();
@@ -207,19 +265,23 @@ public class Client {
     public void stop()
     {
         if (thread == null) {
+            // has not been started
             return;
         }
 
         try {
             thread.active = false;
             thread.join();
-        } catch (InterruptedException ignored) {
+        } catch (InterruptedException ignored) {}
+
+
+        if (dhtEnabled) {
+            // save DHT state as we can't get in later from the air
+            byte[] state = node.getStateWithBlocking();
+            storage.write(DHT_NODE_STATE_SAVE_KEY, state);
+            node.stop();
         }
 
-        byte[] data = node.getStateWithBlocking();
-        node.stop();
-
-        storage.write("dht", data);
         storage.stop();
     }
 
@@ -237,8 +299,8 @@ public class Client {
                 PeerConnection p = (PeerConnection) sKey.attachment();
                 p.onChannelReady();
             }, 10);
-        } catch (IOException e) {
-            e.printStackTrace();
+        } catch (IOException ignored) {
+            // todo
         }
 
         long now = System.currentTimeMillis();
@@ -249,6 +311,7 @@ public class Client {
 
             if (DEBUG) {
                 if (TORRENT_DUMP_TIMEOUT < now - torrent.timeLastDump) {
+                    torrent.timeLastDump = now;
                     torrent.dump();
                 }
             }
@@ -259,12 +322,23 @@ public class Client {
             timeLastSpeedLimitsUpdate = now;
         }
 
-        if (DHT_NODE_STATE_SAVE_TIMEOUT < now - timeLastDHTStateSave) {
-            timeLastDHTStateSave = now;
-            node.getState(data -> {
-                storage.write("dht", data);
-            });
+        if (isDhtEnabled())
+        {
+            if (DHT_NODE_STATE_SAVE_TIMEOUT < now - timeLastDHTStateSave)
+            {
+                timeLastDHTStateSave = now;
+
+                if (node.bootstrapped) {
+                    // save state only of node bootstrapped
+                    // otherwise it's possible to ruin the state
+                    node.getState(data -> {
+                        storage.write(DHT_NODE_STATE_SAVE_KEY, data);
+                    });
+                }
+            }
         }
+
+        trackersManager.update();
     }
 
     /**
