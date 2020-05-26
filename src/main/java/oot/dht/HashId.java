@@ -43,14 +43,23 @@ public class HashId implements Comparable {
     public static final int HASH_LENGTH_BYTES = 20;
     public static final int HASH_LENGTH_BITS =  8 * HASH_LENGTH_BYTES;
 
-
-
+    /**
+     * data bytes
+     */
     byte[] data;
 
+    /**
+     * allowed constructor
+     */
     public HashId() {
         data = new byte[HASH_LENGTH_BYTES];
     }
 
+    /**
+     * allowed constructor
+     * @param id original array with id
+     * @param wrap true if we can wrap and use the specified array
+     */
     public HashId(byte[] id, boolean wrap) {
         if ((id == null) || (id.length < HASH_LENGTH_BYTES)) {
             throw new RuntimeException();

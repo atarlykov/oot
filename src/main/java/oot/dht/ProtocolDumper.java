@@ -138,6 +138,7 @@ public class ProtocolDumper {
         if (y == null) {
             // no query type, can't parse
             System.out.println(builder.toString());
+            message.dump(4);
             return;
         }
 
@@ -271,7 +272,7 @@ public class ProtocolDumper {
                 if (e.bString != null) {
                     dumpAddressCompactForm(builder, e.bString, 0);
                     if (i < valuesSize - 1) {
-                        builder.append('\n').append("                    :");
+                        builder.append('\n').append("                      :");
                     }
                 }
             }

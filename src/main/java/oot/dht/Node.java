@@ -28,7 +28,7 @@ public class Node {
     /**
      * switch to allow debug messages to stdout
      */
-    private static final boolean DEBUG = true;
+    private static final boolean DEBUG = false;
 
     /**
      * max number of packets received and processed in one turn
@@ -91,7 +91,7 @@ public class Node {
     /**
      * routing table with information about all known nodes
      */
-    public RoutingTable routing = new RoutingTable(this);
+    RoutingTable routing = new RoutingTable(this);
 
     /**
      * stores peers that announced themselves as downloaders
@@ -100,7 +100,7 @@ public class Node {
      *
      * todo include local node
      */
-    public Map<HashId, Set<RoutingTable.RemoteNode>> peers = new HashMap<>();
+    Map<HashId, Set<RoutingTable.RemoteNode>> peers = new HashMap<>();
 
     /**
      * stores remote nodes that sent us get_peers request and we've
@@ -117,19 +117,24 @@ public class Node {
 
      * map<node id, remote node>
      */
-    public Map<HashId, RoutingTable.RemoteNode> tokens = new HashMap<>();
+    Map<HashId, RoutingTable.RemoteNode> tokens = new HashMap<>();
 
     /**
-     * if specified this callback will be called for any announce_peer
+     * if registered this callback will be called for any announce_peer
      * message received by this node, could be used to notify torrent client
      * with new peers
-     * todo make registration method
      */
-    public BiConsumer<HashId, InetSocketAddress> callbackAnnounce;
+    private volatile BiConsumer<HashId, InetSocketAddress> callbackAnnounce;
+    /**
+     * if registered this callback will be called when node
+     * becomes bootstrapped, usually called only once,
+     * bout could be call more time in case of start-stop-start-stop-.. sequence
+     */
+    private volatile Consumer<Void> callbackBootstrapped;
 
     // indicates if this node has connection
     // to dht network or not, used to delay operations' requests
-    private boolean bootstrapped = false;
+    public volatile boolean bootstrapped = false;
 
     // transaction id for a new operation initiated by the local node
     // todo: extend to long (as received from the wild)
@@ -229,12 +234,21 @@ public class Node {
     }
 
     /**
-     * registerss announce callback to be notified when external announce message is received,
+     * registers announce callback to be notified when external announce message is received,
      * callback will be called from the node executing thread
      * @param callbackAnnounce callback
      */
     public void setCallbackAnnounce(BiConsumer<HashId, InetSocketAddress> callbackAnnounce) {
         this.callbackAnnounce = callbackAnnounce;
+    }
+
+    /**
+     * registers bootstrap callback to be notified when node becomes alive
+     * callback will be called from the node executing thread
+     * @param callbackBootstrapped callback
+     */
+    public void setCallbackBootstrapped(Consumer<Void> callbackBootstrapped) {
+        this.callbackBootstrapped = callbackBootstrapped;
     }
 
     /**
@@ -306,7 +320,7 @@ public class Node {
      * starts separate thread to maintain this node
      * and run operations
      */
-    public synchronized void start() throws Exception
+    public synchronized void start() throws IOException
     {
         if (thread != null) {
             // already started
@@ -320,6 +334,10 @@ public class Node {
         thread = new NodeThread(10);
         thread.setDaemon(false);
         thread.start();
+
+        // initiate bootstrap process in any case,
+        // this will update remote nodes if exist
+        addOperation(new BootstrapOperation(this, null, null));
     }
 
 
@@ -342,6 +360,9 @@ public class Node {
             }
         } catch (IOException ignored) {
         }
+
+        // will be used on possible subsequent starts
+        bootstrapped = false;
     }
 
     /**
@@ -352,7 +373,6 @@ public class Node {
         try {
             // this method is usually called only once, so just create random here
             SecureRandom random = SecureRandom.getInstanceStrong();
-            random.reseed();
             byte[] data = new byte[HashId.HASH_LENGTH_BYTES];
             random.nextBytes(data);
             return HashId.wrap(data);
@@ -368,9 +388,9 @@ public class Node {
     /**
      * performs reinitialization of the node,
      * could be called from a processing thread
-     * @throws Exception af any
+     * @throws IOException af any
      */
-    private void reinit() throws Exception
+    private void reinit() throws IOException
     {
         if (channel != null) {
             try {
@@ -442,6 +462,8 @@ public class Node {
             addOperation(new PingNodesInRoutingTableOperation(this));
             timeJobPingRouting = now;
         }
+
+        // todo run periodical updates to find more nodes
     }
 
     /**
@@ -546,6 +568,12 @@ public class Node {
 
             // is this a response message?
             BEValue y = parsed.dictionary.get("y");
+
+            if (y == null) {
+                // skip incorrect messages without type
+                continue;
+            }
+
             if (y.equals('r')) {
                 processExternalResponse(address, parsed);
                 continue;
@@ -814,11 +842,15 @@ public class Node {
                 // address type and address
                 os.write(1);
                 os.writeBytes(address.getAddress());
+                os.write((rn.address.getPort() >> 8) & 0xFF);
+                os.write( rn.address.getPort() & 0xFF);
             }
             else if (address instanceof Inet6Address) {
                 // address type and address
                 os.write(2);
                 os.writeBytes(address.getAddress());
+                os.write((rn.address.getPort() >> 8) & 0xFF);
+                os.write( rn.address.getPort() & 0xFF);
             } else {
                 // address type unknown, no address data
                 os.write(-1);
@@ -872,7 +904,9 @@ public class Node {
 
         tmp = new byte[HashId.HASH_LENGTH_BYTES];
         buffer.get(tmp);
-        HashId nodeId = HashId.wrap(tmp);
+        // must apply id right here as child
+        // elements will use it on insert
+        id = HashId.wrap(tmp);
 
         int nodes = buffer.getShort();
 
@@ -894,12 +928,12 @@ public class Node {
                 tmp = new byte[4];
                 buffer.get(tmp);
                 iAddr = Inet4Address.getByAddress(tmp);
-                port = buffer.getShort();
+                port = buffer.getShort() & 0xFFFF;
             } else if (type == 2) {
                 tmp = new byte[16];
                 buffer.get(tmp);
                 iAddr = Inet6Address.getByAddress(tmp);
-                port = buffer.getShort();
+                port = buffer.getShort() & 0xFFFF;
             } else if (type == -1) {
                 // node without address, skip
                 iAddr = null;
@@ -915,7 +949,6 @@ public class Node {
         }
 
         // apply
-        id = nodeId;
         routing = rTable;
 
         return true;
@@ -1724,16 +1757,24 @@ public class Node {
                 RoutingTable.RemoteNode rNode = nodes.get(i);
                 if (rNode.id.equals(queriedNodeId)) {
                     if (DEBUG) {
+                        if (!BEValue.isBString(beToken)) {
+                            System.out.println(address.toString()
+                                    + " get_peers returned empty token");
+                        }
                         if ((rNode.token != null) && !Arrays.equals(rNode.token, beToken.bString)) {
                             System.out.println(address.toString()
                                             + " get_peers returned another token (need support?)  time:" + (now - rNode.timeToken));
                         }
                     }
-                    rNode.token = beToken.bString;
 
-                    // we don't know if original node is from the routing or not,
-                    // so try to update there
-                    node.routing.update(rNode);
+                    if (BEValue.isBStringNotEmpty(beToken))
+                    {
+                        rNode.token = beToken.bString;
+                        // we don't know if original node is from the routing or not,
+                        // so try to update there
+                        node.routing.update(rNode);
+                    }
+
                     break;
                 }
             }
@@ -1923,7 +1964,7 @@ public class Node {
 
 
     /**
-     * Complex operation that iterative find_node operations
+     * Complex operation that runs iterative find_node operations
      * for the given hash, could be used for bootstrapping with
      * hash of the local node or to find nodes to announce a torrent,
      * calling party could be notified on operation finish via callback
@@ -2139,7 +2180,7 @@ public class Node {
         /**
          * default timeout for bootstrap operation to stop, in milliseconds
          */
-        static final long OPERATION_TIMEOUT = 16_000L;
+        static final long OPERATION_TIMEOUT = 64_000L;
 
         /**
          * allowed constructor
@@ -2151,7 +2192,22 @@ public class Node {
          *                     if routing has active nodes in it and false otherwise
          */
         public BootstrapOperation(Node _node, List<InetSocketAddress> _seed, Consumer<Boolean> _extCallback) {
-            super(_node, _node.id, _extCallback, OPERATION_TIMEOUT, MAX_ITERATIONS, _seed);
+            super(_node, _node.id, (alive) ->
+            {
+                // will be called via Node's thread
+                if (alive) {
+                    // notify callback if it's the 1st bootstrap
+                    Consumer<Void> cbBootstrapped = _node.callbackBootstrapped;
+                    if (!_node.bootstrapped && (cbBootstrapped != null)) {
+                        cbBootstrapped.accept(null);
+                    }
+                    // update state
+                    _node.bootstrapped = true;
+                }
+                if (_extCallback != null) {
+                    _extCallback.accept(alive);
+                }
+            }, OPERATION_TIMEOUT, MAX_ITERATIONS, _seed);
         }
     }
 
@@ -2160,7 +2216,12 @@ public class Node {
      * Complex operation to searches for peers that stores
      * any specific torrent (hash)
      */
-    private static class FindTorrentPeersOperation extends Operation {
+    private static class FindTorrentPeersOperation extends Operation
+    {
+        /**
+         * default timeout for operation to stop, in milliseconds
+         */
+        static final long OPERATION_TIMEOUT = 64_000L;
         /**
          * max number of iteration during search process
          */
@@ -2222,8 +2283,9 @@ public class Node {
          * @param _target target hash to search for
          * @param _extCallback callback to call on finish
          */
-        public FindTorrentPeersOperation(Node _node, HashId _target, Consumer<Set<InetSocketAddress>> _extCallback) {
-            super(_node);
+        public FindTorrentPeersOperation(Node _node, HashId _target, Consumer<Set<InetSocketAddress>> _extCallback)
+        {
+            super(_node, System.currentTimeMillis(), OPERATION_TIMEOUT);
             target = _target;
             extCallback = _extCallback;
             queried = new HashSet<>();
@@ -2285,6 +2347,7 @@ public class Node {
                 iterationCounter++;
 
                 // update collection of all found peers
+                // todo: notify every time?
                 peers.addAll(peersFound);
 
                 // NOTE
@@ -2996,9 +3059,7 @@ public class Node {
             rNode.updateLastActivityTime();
 
             HashId hashTarget = HashId.wrap(target);
-
-            Set<RoutingTable.RemoteNode> downloaders =
-                    node.peers.computeIfAbsent(hashTarget, k -> new HashSet<>());
+            Set<RoutingTable.RemoteNode> downloaders = node.peers.computeIfAbsent(hashTarget, k -> new HashSet<>());
             downloaders.add(rNode);
 
             InetSocketAddress peerAddress = address;
@@ -3009,10 +3070,11 @@ public class Node {
                 rNode.setPeerPort(0);
             }
 
-            if (node.callbackAnnounce != null) {
-                node.callbackAnnounce.accept(hashTarget, peerAddress);
+            // notify global listeners about announce received
+            BiConsumer<HashId, InetSocketAddress> cbAnnounce = node.callbackAnnounce;
+            if (cbAnnounce != null) {
+                cbAnnounce.accept(hashTarget, peerAddress);
             }
-
         }
 
         /**
