@@ -6,12 +6,10 @@ import oot.dht.HashId;
 
 import java.io.IOException;
 import java.net.*;
-import java.net.http.HttpClient;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.DatagramChannel;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 /**
@@ -20,28 +18,49 @@ import java.util.function.Consumer;
 class TrackersManager {
 
     private final static boolean DEBUG = true;
-    private final static long TRACKERS_CHECK_TIMEOUT = 1000;
-
+    /**
+     * period to send announce requests for all active torrents
+     */
+    private final static long TRACKERS_CHECK_TIMEOUT = 1800_000L;
     /**
      * period to consider received connection id valid
      */
     private final static long UDP_CONNECTION_ID_TIMEOUT = 60 * 1000;
-
+    /**
+     * max number of received datagrams to handle per one iteration of update
+     */
+    private final static int UDP_DATAGRAMS_PER_CYCLE_MAX = 16;
+    /**
+     * magic id for connect message to udp tracker
+     */
     private final static long UDP_PROTOCOL_MAGIC_ID = 0x41727101980L;
 
     /**
-     * ref to executor service for running
-     * background tasks (http client, etc)
+     * type of events for announce requests to trackers
      */
-    //ExecutorService executor;
+    enum AnnounceEvent {
+        // default/update
+        NONE(0),
+        //torrent completed
+        COMPLETED(1),
+        // download started
+        STARTED(2),
+        // download stopped
+        STOPPED(3);
+        /**
+         * code of the event (as in the spec)
+         */
+        int value;
+
+        AnnounceEvent(int _value) {
+            value = _value;
+        }
+    }
+
     /**
      * ref to the parent client
      */
     Client client;
-    /**
-     * http client to communicate with trackers via http/https protocols
-     */
-    HttpClient http;
     /**
      * udp channel to support udp trackers
      */
@@ -455,43 +474,35 @@ class TrackersManager {
      */
     List<Operation> operations = new ArrayList<>();
 
-    int tx;
+    /**
+     * current transaction id
+     */
+    private int tx;
 
-    int nextTransactionId() {
-        // todo random
+    /**
+     * @return next transaction id
+     */
+    int nextTransactionId()
+    {
+        // todo make it random
         tx += 1;
         return tx;
     }
 
     /**
-     * service method, sends prepared send buffer
-     * @param address destination address to send too
-     * @return true if datagram was successfully sent and
-     * false otherwise (that could be buffer overflow or some io error)
+     * allowed constructor
+     * @param _client ref to parent client
      */
-    private boolean send(InetSocketAddress address) {
-        try {
-            if (DEBUG) TrackersManager.dumpMessage(true, false, buffer, address);
-
-            int sent = channel.send(buffer, address);
-            if (sent == 0)
-            {
-                // there were no space in system send buffer,
-                // exit and let retry on the next update turn
-                return false;
-            }
-
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
     public TrackersManager(Client _client) {
         client = _client;
     }
 
-    public void init() throws IOException {
+    /**
+     * initializes manager
+     * @throws IOException if any io error occurred
+     */
+    public void init() throws IOException
+    {
         channel = DatagramChannel.open(StandardProtocolFamily.INET);
         channel.bind(null);
         //InetSocketAddress localAddress = (InetSocketAddress) channel.getLocalAddress();
@@ -501,7 +512,7 @@ class TrackersManager {
     }
 
     /**
-     * must be called in bounds of the same thread as update()
+     * stops the manager
      */
     public void stop()
     {
@@ -517,28 +528,29 @@ class TrackersManager {
         // it's possible we have http operations executed via client' executor
     }
 
-    enum AnnounceEvent {
-        NONE(0),
-        COMPLETED(1),
-        STARTED(2),
-        STOPPED(3);
-
-        int value;
-        AnnounceEvent(int _value) {
-            value = _value;
-        }
-    }
-
+    /**
+     * announces the specified torrent to it's trackers with the specific event
+     * @param torrent torrent to announce
+     * @param event event
+     */
     public void announce(Torrent torrent, AnnounceEvent event) {
         for(Tracker tracker: torrent.trackers) {
             announce(tracker, event);
         }
     }
 
+    /**
+     * announce torrent to the specific tracker
+     * @param tracker tracker (has ref to parent torrent)
+     * @param event event
+     */
     public void announce(Tracker tracker, AnnounceEvent event)
     {
         String url = tracker.getCurrentUrl();
-        if (url.startsWith("http://") || url.startsWith("https://")) {
+        if (url.startsWith("http://") || url.startsWith("https://"))
+        {
+            // HTTP(S) tracker, handle via executor,
+            // could be optimized
             String query = tracker.buildAnnounceUrl(url);
             client.executor.submit(() -> {
                 try {
@@ -551,27 +563,28 @@ class TrackersManager {
                 }
             });
         }
-        else if (url.startsWith("udp://")) {
+        else if (url.startsWith("udp://"))
+        {
+            // UDP tracker, handle internally
             operations.add(new UDPAnnounceOperation(tracker, event, null));
         }
     }
 
 
-    public void scrape(Tracker t) {
-    }
-
-
-    void updateActiveTorrents()
+    /**
+     * re-announces active torrents
+     */
+    private void updateActiveTorrents()
     {
         long now = System.currentTimeMillis();
 
         List<Torrent> torrents = client.getTorrents();
         for (int i = 0; i < torrents.size(); i++) {
             Torrent torrent = torrents.get(i);
-
             for (Tracker tracker : torrent.trackers)
             {
-                if (Tracker.TIMEOUT_ANNOUNCE < now - tracker.timeLastAnnounce) {
+                if (Tracker.TIMEOUT_ANNOUNCE < now - tracker.timeLastAnnounce)
+                {
                     // update time right here to prevent double submissions
                     tracker.timeLastAnnounce = System.currentTimeMillis();
                     announce(tracker, AnnounceEvent.NONE);
@@ -584,6 +597,34 @@ class TrackersManager {
     }
 
 
+    /**
+     * service method, sends prepared send buffer
+     * @param address destination address to send too
+     * @return true if datagram was successfully sent and
+     * false otherwise (that could be buffer overflow or some io error)
+     */
+    private boolean send(InetSocketAddress address) {
+        try {
+            if (DEBUG) TrackersManager.dumpUdpMessage(true, false, buffer, address);
+
+            int sent = channel.send(buffer, address);
+            if (sent == 0)
+            {
+                // there were no space in system send buffer,
+                // exit and let retry on the next update turn
+                return false;
+            }
+
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * main method, called from the client's loop
+     * to perform state updates
+     */
     void update()
     {
         long now = System.currentTimeMillis();
@@ -593,13 +634,10 @@ class TrackersManager {
             updateActiveTorrents();
         }
 
-        int counter = 16;
-
+        int datagrams = UDP_DATAGRAMS_PER_CYCLE_MAX;
         try {
-            while (0 < counter)
+            while (0 < datagrams--)
             {
-                counter -= 1;
-
                 SocketAddress address;
 
                 buffer.clear();
@@ -610,15 +648,18 @@ class TrackersManager {
                 }
 
                 buffer.flip();
-                if (DEBUG) TrackersManager.dumpMessage(false, false, buffer, (InetSocketAddress) address);
+                if (DEBUG) TrackersManager.dumpUdpMessage(false, false, buffer, (InetSocketAddress) address);
 
                 if (buffer.remaining() < 8) {
+                    // incorrect message, minimal
+                    // number of fields is missing
                     continue;
                 }
 
+                // peek transaction & sent to the linked operation
                 int tx = buffer.getInt(4);
-
-                for (int i = 0; i < operations.size(); i++) {
+                for (int i = 0; i < operations.size(); i++)
+                {
                     Operation operation = operations.get(i);
                     if (tx == operation.tx) {
                         boolean finished = operation.receive(buffer);
@@ -630,10 +671,12 @@ class TrackersManager {
                 }
             }
         } catch (IOException ignored) {
-                // todo
+            if (DEBUG) System.out.println("trackerManager: io error: " + ignored.getMessage());
         }
 
-        for (int i = operations.size() - 1; 0 <= i; i--) {
+        // update alloperations
+        for (int i = operations.size() - 1; 0 <= i; i--)
+        {
             Operation operation =  operations.get(i);
             boolean finished = operation.update();
             if (finished) {
@@ -641,8 +684,6 @@ class TrackersManager {
             }
         }
     }
-
-
 
 
     /**
@@ -787,7 +828,14 @@ class TrackersManager {
         }
     }
 
-    private static void dumpMessage(boolean outbound, boolean skipped, ByteBuffer buffer, InetSocketAddress address)
+    /**
+     * dumps udp message to stdout
+     * @param outbound true if message is outgoing
+     * @param skipped true if message was not really sent (errors)
+     * @param buffer buffer with the message (will not be modified)
+     * @param address destination / source address
+     */
+    private static void dumpUdpMessage(boolean outbound, boolean skipped, ByteBuffer buffer, InetSocketAddress address)
     {
         StringBuilder builder = new StringBuilder();
         if (outbound) {

@@ -6,10 +6,12 @@ import oot.dht.Node;
 
 import java.io.IOException;
 import java.nio.channels.Selector;
+import java.nio.charset.StandardCharsets;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.*;
 
@@ -271,9 +273,12 @@ public class Client {
 
         try {
             thread.active = false;
+            // this will give us happens-before
+            // for all subsequent operations
             thread.join();
         } catch (InterruptedException ignored) {}
 
+        trackersManager.stop();
 
         if (dhtEnabled) {
             // save DHT state as we can't get in later from the air
@@ -424,5 +429,191 @@ public class Client {
             }
         }
     }
+
+    /**
+     * extracts client name from hash id, supports not all the clients
+     * @param id hash id of the client to decode
+     * @return not null string name
+     */
+    public String extractClientNameFromId(HashId id)
+    {
+        if (id == null) {
+            return "unknown";
+        }
+
+        byte[] data = id.getBytes();
+        if (data[0] == 'M') {
+            StringBuilder client = new StringBuilder("mainline ");
+            int i = 1;
+            while ((data[i] == '-') || Character.isDigit(data[i])) {
+                client.append(data[i] & 0xFF);
+            }
+            return client.toString();
+        }
+
+        if ((data[0] == 'e') && (data[1] == 'x') && (data[2] == 'b') && (data[3] == 'c')) {
+            return "BitComet " + (data[4] & 0xFF) + "." + (data[5] & 0xFF);
+        }
+
+        if ((data[0] == 'X') && (data[1] == 'B') && (data[2] == 'T')) {
+            return "XBT " + (data[3] & 0xFF) + "." + (data[4] & 0xFF) + "." + (data[5] & 0xFF) + (data[6] == 'd' ? " debug" : "");
+        }
+
+        if ((data[0] == 'O') && (data[1] == 'P')) {
+            return "Opera " + (data[2] & 0xFF) + "." + (data[3] & 0xFF) + "." + (data[4] & 0xFF) + "." + (data[5] & 0xFF);
+        }
+
+        if ((data[0] == '-') && (data[1] == 'M') && (data[2] == 'L')) {
+            // -ML2.7.2-
+            return "MLdonkey " + extractClientAsciiText(data, 3);
+        }
+
+        if ((data[0] == '-') && (data[1] == 'B') && (data[2] == 'O') && (data[3] == 'W')) {
+            return "Bits on Wheels" + extractClientAsciiText(data, 4);
+        }
+
+        //if ((data[0] == 'Q')) {
+        //    return "Queen Bee (?) " + decodePeerAsciiTail(data, 1);
+        //}
+
+        if ((data[0] == '-') && (data[1] == 'F') && (data[2] == 'G')) {
+            return "FlashGet " + extractClientAsciiText(data, 3);
+        }
+
+        if (data[0] == 'A') {
+            return "ABC " + extractClientAsciiText(data, 1);
+        }
+        if (data[0] == 'O') {
+            return "Osprey Permaseed " + extractClientAsciiText(data, 1);
+        }
+        if (data[0] == 'Q') {
+            return "BTQueue or Queen Bee " + extractClientAsciiText(data, 1);
+        }
+        if (data[0] == 'R') {
+            return "Tribler " + extractClientAsciiText(data, 1);
+        }
+        if (data[0] == 'S') {
+            return "Shadow " + extractClientAsciiText(data, 1);
+        }
+        if (data[0] == 'T') {
+            return "BitTornado " + extractClientAsciiText(data, 1);
+        }
+        if (data[0] == 'U') {
+            return "UPnP NAT Bit Torrent " + extractClientAsciiText(data, 1);
+        }
+
+        if ((data[0] == '-') && (data[7] == '-')) {
+            String code = new String(data, 1, 2, StandardCharsets.UTF_8);
+            StringBuilder client = new StringBuilder();
+            String name = CLIENTS_DASH.get(code);
+            if (name != null) {
+                client.append(name);
+            } else {
+                client.append((char)data[1]).append((char)data[2]);
+            }
+            client.append(' ');
+            client.append(Character.digit(data[3] & 0xFF, 10));
+            client.append('.');
+            client.append(Character.digit(data[4] & 0xFF, 10));
+            client.append('.');
+            client.append(Character.digit(data[5] & 0xFF, 10));
+            client.append('.');
+            client.append(Character.digit(data[6] & 0xFF, 10));
+            return client.toString();
+        }
+
+        return "unknown " + extractClientAsciiText(data, 0);
+    }
+
+    /**
+     * transforms part of byte data into string using
+     * not terminated sequence of ascii letters and digits
+     * @param data byte array to extract ascii like text
+     * @param position start position in the array
+     * @return not null string
+     */
+    private String extractClientAsciiText(byte[] data, int position)
+    {
+        StringBuilder tmp = new StringBuilder();
+        while ((position < data.length)
+                && (0 < data[position])
+                && (('.' == data[position]) || ('-' == data[position]) || Character.isLetterOrDigit(data[position])))
+        {
+            tmp.append((char)data[position]);
+        }
+        return tmp.toString();
+    }
+
+    /**
+     * collection of known clients' abbreviations
+     */
+    private final static Map<String, String> CLIENTS_DASH = Map.ofEntries(
+            Map.entry("AG", "Ares"),
+            Map.entry("A~", "Ares"),
+            Map.entry("AR", "Arctic"),
+            Map.entry("AV", "Avicora"),
+            Map.entry("AX", "BitPump"),
+            Map.entry("AZ", "Azureus"),
+            Map.entry("BB", "BitBuddy"),
+            Map.entry("BC", "BitComet"),
+            Map.entry("BF", "Bitflu"),
+            Map.entry("BG", "BTG (uses Rasterbar libtorrent)"),
+            Map.entry("BR", "BitRocket"),
+            Map.entry("BS", "BTSlave"),
+            Map.entry("BX", "~Bittorrent X"),
+            Map.entry("CD", "Enhanced CTorrent"),
+            Map.entry("CT", "CTorrent"),
+            Map.entry("DE", "DelugeTorrent"),
+            Map.entry("DP", "Propagate Data Client"),
+            Map.entry("EB", "EBit"),
+            Map.entry("ES", "electric sheep"),
+            Map.entry("FT", "FoxTorrent"),
+            Map.entry("FW", "FrostWire"),
+            Map.entry("FX", "Freebox BitTorrent"),
+            Map.entry("GS", "GSTorrent"),
+            Map.entry("HL", "Halite"),
+            Map.entry("HN", "Hydranode"),
+            Map.entry("KG", "KGet"),
+            Map.entry("KT", "KTorrent"),
+            Map.entry("LH", "LH-ABC"),
+            Map.entry("LP", "Lphant"),
+            Map.entry("LT", "libtorrent"),
+            Map.entry("lt", "libTorrent"),
+            Map.entry("LW", "LimeWire"),
+            Map.entry("MO", "MonoTorrent"),
+            Map.entry("MP", "MooPolice"),
+            Map.entry("MR", "Miro"),
+            Map.entry("MT", "MoonlightTorrent"),
+            Map.entry("NX", "Net Transport"),
+            Map.entry("PD", "Pando"),
+            Map.entry("qB", "qBittorrent"),
+            Map.entry("QD", "QQDownload"),
+            Map.entry("QT", "Qt 4 Torrent example"),
+            Map.entry("RT", "Retriever"),
+            Map.entry("S~", "Shareaza alpha/beta"),
+            Map.entry("SB", "~Swiftbit"),
+            Map.entry("SS", "SwarmScope"),
+            Map.entry("ST", "SymTorrent"),
+            Map.entry("st", "sharktorrent"),
+            Map.entry("SZ", "Shareaza"),
+            Map.entry("TN", "TorrentDotNET"),
+            Map.entry("TR", "Transmission"),
+            Map.entry("TS", "Torrentstorm"),
+            Map.entry("TT", "TuoTu"),
+            Map.entry("UL", "uLeecher!"),
+            Map.entry("UT", "µTorrent"),
+            Map.entry("UW", "µTorrent Web"),
+            Map.entry("VG", "Vagaa"),
+            Map.entry("WD", "WebTorrent Desktop"),
+            Map.entry("WT", "BitLet"),
+            Map.entry("WW", "WebTorrent"),
+            Map.entry("WY", "FireTorrent"),
+            Map.entry("XL", "Xunlei"),
+            Map.entry("XT", "XanTorrent"),
+            Map.entry("XX", "Xtorrent"),
+            Map.entry("ZT", "ZipTorrent"),
+            Map.entry("BD", "BD"),
+            Map.entry("NP", "NP"),
+            Map.entry("wF", "wF"));
 
 }
