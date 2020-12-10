@@ -7,7 +7,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * utility class for dumping DHT protocol messages
- * for debug reasons
+ * for debug purposes
  */
 public class ProtocolDumper {
 

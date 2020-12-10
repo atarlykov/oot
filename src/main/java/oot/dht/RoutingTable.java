@@ -4,8 +4,16 @@ import java.net.InetSocketAddress;
 import java.util.*;
 
 /**
- * based on distances to an anchor node to make
- * buckets' tree simpler
+ * Holds DHT routing information in the hierarchical way
+ * as specified in the specification. Builds table based on distances
+ * between remote nodes:
+ *  [0] level - nodes with distances: [1xxxxxx ...] (bits)
+ *  [1] level - nodes with distances: [01xxxxx ...] (bits)
+ *
+ * but each level (if it's the last one at the moment) could store
+ * nodes from a lower level, like:
+ *  [0] level - nodes with distances: [1xxxxxx ...] and [0xxxxxx ...],
+ * last will be moved to the next level when it's created
  */
 public class RoutingTable {
 
@@ -76,14 +84,15 @@ public class RoutingTable {
         long timeToken;
 
         // timestamp of an external announce message from this node
-        long timeAnnounceExtenal;
+        long timeAnnounceExternal;
 
-        // ??
+        // number of replies not received,
+        // used to track alive nodes
         int deadReplies = 0;
 
         /**
          * allowed constructor
-         * @param _id ndoe id
+         * @param _id node id
          * @param _address remote address
          */
         RemoteNode(HashId _id, InetSocketAddress _address) {
@@ -94,7 +103,7 @@ public class RoutingTable {
         }
 
         /**
-         * @return true is this node iss still considered as alive
+         * @return true is this node is still considered as alive
          */
         boolean isAlive() {
             return (deadReplies < NODE_DEAD_REPLIES)
@@ -126,7 +135,7 @@ public class RoutingTable {
          * @return true if announce received from the node has expired
          */
         boolean isAnnounceExternalExpired() {
-            return timeAnnounceExtenal + NODE_ANNOUNCE_TIMEOUT < System.currentTimeMillis();
+            return timeAnnounceExternal + NODE_ANNOUNCE_TIMEOUT < System.currentTimeMillis();
         }
 
         /**
@@ -189,7 +198,12 @@ public class RoutingTable {
     }
 
     /**
-     * Bucket to organize nodes on the same level of routing tree
+     * Bucket to organize nodes on the same level of the routing tree,
+     *
+     * each bucket holds up to K nodes (default is 8),
+     * if new node to be added is inside the bucket, subdivide on 2 buckets of the same size
+     * using the left significant bit as the divider and distribute nodes:
+     *
      */
     static class Bucket {
         /**
@@ -198,7 +212,7 @@ public class RoutingTable {
          */
         static final int K = 8;
         /**
-         * level of the bucket, top one is zero
+         * level of the bucket, the top one is zero
          */
         private int level;
 
@@ -214,21 +228,22 @@ public class RoutingTable {
          */
         Bucket child;
         /**
-         * ref to parent bucket with nore distant nodes
+         * ref to parent bucket with more distant nodes
          */
         Bucket parent;
 
         //private long timeout;
 
         /**
-         * build root node
+         * builds root node that has no parent
          */
         Bucket() {
             this(null);
         }
 
         /**
-         * builds child node that will be linked to the specified parent
+         * builds child node that will be linked to the specified parent,
+         * level will be calculates as (parent + 1)
          * @param _parent ref to parent node, could be null for root node
          */
         Bucket(Bucket _parent) {
@@ -238,22 +253,24 @@ public class RoutingTable {
 
         /**
          * inserts new node into the table if there is a space for it
-         * on the appropriate level
+         * on the appropriate level (based on distance)
          * @param node node to insert
          * @return inserted node specified as parameter or the one
          * with the same id that is already in the tree,
          * returns NULL if node was not added due to space limits
          */
-        RemoteNode insert(RemoteNode node) {
-            // is this id could be moved to lower levels if possible
+        RemoteNode insert(RemoteNode node)
+        {
+            //  could this id be moved to lower levels (if possible)
             boolean isIdForLowerLevel = !node.distance.getBit(level);
 
-            if ((child != null) && isIdForLowerLevel) {
-                // child tree already exists and 'id' is for lower levels
+            if (isIdForLowerLevel && (child != null)) {
+                // child tree *already* exists and 'id' is for lower levels
                 return child.insert(node);
             }
 
-            // try populate our level
+            // try populate current level,
+            // (it's for our level or still has no child levels)
             if (elements.size() < K) {
                 // add node into the current bucket controlling sort order
                 // (note: could return false if the same id is already in the list)
@@ -262,14 +279,14 @@ public class RoutingTable {
 
             // we don't try to remove dead nodes from the bucket here
             // as this is performed periodically during a ping procedure,
-            // todo: remove
-            // just try to subdivide the bucket and grow routing tree down.
+            // todo: review & remove
+            // just try to subdivide the bucket and grow the routing tree down.
             // note: it's possible that bucket already contains elements for child level,
             // so we must not depend on isIdForLowerLevel
-            if ((child == null) && (level < HashId.HASH_LENGTH_BITS - 1)) {
-
-                // potential child elements could only be stored at the beginning of the list,
-                // as they all have zero left bit set,
+            if ((child == null) && (level < HashId.HASH_LENGTH_BITS - 1))
+            {
+                // potential child elements could only be stored at the beginning of the bucket's list,
+                // as they all have zero left significant bit,
                 // count candidates for the next lower level
                 int index = 0;
                 while ((index < elements.size()) && !elements.get(index).distance.getBit(level)) {
@@ -277,7 +294,6 @@ public class RoutingTable {
                 }
 
                 // now index points to the 1st element than can't be moved to the lower level
-
                 if (isIdForLowerLevel || (0 < index)) {
                     // we have nodes in the bucket that could be moved to the next level
                     // or new node is itself is for the next level,
@@ -290,7 +306,7 @@ public class RoutingTable {
                         child.elements.add( elements.get(i));
                     }
 
-                    // batch clear copied elements
+                    // batch clear copied elements (must be optimized out by jvm)
                     elements.subList(0, index).clear();
 
                     if (isIdForLowerLevel) {
@@ -312,7 +328,8 @@ public class RoutingTable {
          * @param node node to insert
          * @return inserted node or the one that is already in the bucket
          */
-        private RemoteNode insertIntoBucketList(RemoteNode node) {
+        private RemoteNode insertIntoBucketList(RemoteNode node)
+        {
             // add node into the current bucket controlling sort order
             int index = Collections.binarySearch(elements, node, RemoteNode::compareByDistance);
             if (index < 0) {
@@ -329,6 +346,8 @@ public class RoutingTable {
          * @return number of removed nodes
          */
         int removeDead() {
+            // bucket is small, so just remove elements one by one,
+            // ArrayList.removeIf() must be an overkill here
             int counter = 0;
             for (int i = elements.size() - 1; 0 <= i; i--) {
                 if (elements.get(i).isDead()) {

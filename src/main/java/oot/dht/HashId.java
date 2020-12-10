@@ -2,87 +2,71 @@ package oot.dht;
 
 import java.util.Arrays;
 
-public class HashId implements Comparable {
+/**
+ * Implements unique 20 bytes hash that is used as nodes' and torrents' identifiers.
+ * Distance between tho hashes is calculated as xor(a, b), where resulting
+ * 20 bytes binary value considered as distance.
+ * todo: move out of dht package, initially was placed here as dht was the full app
+ */
+public class HashId implements Comparable<HashId> {
     /**
-     *
-     * 20 bytes: infohash + nodeid
-     * distance == xor, smaller --> closer
-     *
-     * ask known for peers:
-     *   know: return peers
-     *   dont: return closer nodes
-     * repeat
-     *
-     * insert itself into nodes closest to hashinfo
-     *
-     *
-     * ask for peers:
-     *   return token
-     *
-     * announce itself must include token
-     *
-     *
-     * routing table:
-     *   node is good: responded within last 15 min / or send a query to us
-     *     after 15 min inactivity --> questionable
-     *     dons't respond to 'multiple' queries --> bad
-     *     good nodes have priority
-     *
-     * range: min=0 max=2**160
-     * each bucket holds K nodes(8)
-     * when bucket
-     *   is full, no more GOOD nodes could be added
-     *   but if our ID is inside it, divide on 2 buckets of the same size and distribute nodes
-     *      [full bucket is split to 0..2**159  and 2**159..2**160]
-     *
-     *  track bucket update time (node add, update status, replace)
-     *
-     *  table MUST be saved between invocations of a program!!!
+     * size of the hash (fixed)
      */
-
     public static final int HASH_LENGTH_BYTES = 20;
     public static final int HASH_LENGTH_BITS =  8 * HASH_LENGTH_BYTES;
 
     /**
-     * data bytes
+     * data bytes of {@link HashId#HASH_LENGTH_BYTES} length
      */
-    byte[] data;
+    final byte[] data;
 
     /**
-     * allowed constructor
+     * allowed constructor,
+     * initializes new zero filled hash
      */
     public HashId() {
         data = new byte[HASH_LENGTH_BYTES];
     }
 
     /**
-     * allowed constructor
-     * @param id original array with id
-     * @param wrap true if we can wrap and use the specified array
+     * allowed constructor,
+     * builds hash from teh specified data array
+     * @param id array with hash data, must be at least of {@link HashId#HASH_LENGTH_BYTES} bytes size
+     * @param wrap true if we can wrap and internally use the specified array with hash data
+     * @throws IllegalArgumentException if data array is too short
      */
     public HashId(byte[] id, boolean wrap) {
-        if ((id == null) || (id.length < HASH_LENGTH_BYTES)) {
-            throw new RuntimeException();
+        if (id == null) {
+            throw new IllegalArgumentException("data has incorrect size for a hash");
         }
         if (wrap) {
+            if (id.length != HASH_LENGTH_BYTES) {
+                throw new IllegalArgumentException("data has incorrect size for a hash");
+            }
             data = id;
         } else {
+            if (id.length < HASH_LENGTH_BYTES) {
+                throw new IllegalArgumentException("data has incorrect size for a hash");
+            }
             data = Arrays.copyOfRange(id, 0, HASH_LENGTH_BYTES);
         }
     }
 
     /**
-     * constructs hash from inside another array, coping data
+     * constructs hash from data inside another array, performs data copy
      * @param binary array with hash inside
      * @param index index in the array with hash data
-     * @throws ArrayIndexOutOfBoundsException if array it too short
+     * @throws ArrayIndexOutOfBoundsException if the specified binary array it too short
      */
     public HashId(byte[] binary, int index) {
+        if (binary == null) {
+            throw new IllegalArgumentException("data has incorrect size for a hash");
+        }
         data = Arrays.copyOfRange(binary, index, index + HASH_LENGTH_BYTES);
     }
 
     /**
-     * copies data into internal array
+     * constructs hash making copy of the data specified
      * @param id id to copy
      */
     public HashId(byte[] id) {
@@ -115,15 +99,8 @@ public class HashId implements Comparable {
     }
 
     @Override
-    public int compareTo(Object o) {
-        if (o == null) {
-            return -1;
-        }
-        if (!(o instanceof HashId)) {
-            throw new ClassCastException();
-        }
-
-        return compare((HashId) o);
+    public int compareTo(HashId o) {
+        return compare(o);
     }
 
     /**
@@ -149,19 +126,6 @@ public class HashId implements Comparable {
         return 0;
     }
 
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-        HashId hashId = (HashId) o;
-        return Arrays.equals(data, hashId.data);
-    }
-
-    @Override
-    public int hashCode() {
-        return Arrays.hashCode(data);
-    }
-
     /**
      * calculates XOR distance between two ids
      * @param other other id
@@ -176,9 +140,10 @@ public class HashId implements Comparable {
     }
 
     /**
-     * bits are indexed from left to right, from upper bit to lower
-     * @param index zero based index
-     * @return bit state with the specified index
+     * Returns the specified bit from the hash,
+     * bits are indexed from left to right, from the upper bit to the lower one
+     * @param index zero based index, [0..HASH_LENGTH_BITS)
+     * @return bit state with the specified index, always returns false if index is too large
      */
     public boolean getBit(int index) {
         if (HASH_LENGTH_BITS <= index) {
@@ -188,7 +153,9 @@ public class HashId implements Comparable {
     }
 
     /**
-     * bits are indexed from left to right, from upper bit to lower
+     * Sets the specified bit in the hash,
+     * bits are indexed from left to right, from upper bit to lower.
+     * Safely returns if index is too large.
      * @param index zero based index
      * @param value value to set
      */
@@ -214,6 +181,19 @@ public class HashId implements Comparable {
 
 
     @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        HashId hashId = (HashId) o;
+        return Arrays.equals(data, hashId.data);
+    }
+
+    @Override
+    public int hashCode() {
+        return Arrays.hashCode(data);
+    }
+
+    @Override
     public String toString() {
         StringBuilder builder = new StringBuilder(HASH_LENGTH_BYTES * 2);
         for (byte b: data) {
@@ -223,5 +203,4 @@ public class HashId implements Comparable {
         }
         return builder.toString();
     }
-
 }
