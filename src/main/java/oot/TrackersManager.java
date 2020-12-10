@@ -340,7 +340,7 @@ class TrackersManager {
             buffer.putLong(tracker.udpConnectionId);
             buffer.putInt(1);
             buffer.putInt(tx);
-            buffer.put(tracker.torrent.metainfo.getInfohash().getBytes());
+            buffer.put(tracker.torrent.metainfo.infohash.getBytes());
             buffer.put(client.id.getBytes());
             long downloaded = tracker.torrent.downloaded.get();
             buffer.putLong(downloaded);

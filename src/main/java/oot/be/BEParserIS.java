@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 /**
  * binary encoding parser, contains base methods to parse raw data
  * and various helpers for custom torrent related cases
+ * @deprecated
  */
 public class BEParserIS {
 

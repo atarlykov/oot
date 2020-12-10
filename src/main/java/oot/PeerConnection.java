@@ -674,7 +674,7 @@ public class PeerConnection {
         sendBuffer.position(sendBuffer.limit());
         sendBuffer.limit(sendBuffer.capacity());
 
-        PeerProtocol.populateHandshake(sendBuffer, torrent.getMetainfo().getInfohash(), torrent.getClient().id);
+        PeerProtocol.populateHandshake(sendBuffer, torrent.getMetainfo().infohash, torrent.getClient().id);
 
         // make all data (previous and new) available
         sendBuffer.limit(sendBuffer.position());

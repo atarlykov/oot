@@ -333,13 +333,14 @@ public class Client {
             {
                 timeLastDHTStateSave = now;
 
-                if (node.bootstrapped) {
-                    // save state only of node bootstrapped
-                    // otherwise it's possible to ruin the state
-                    node.getState(data -> {
+                // save state only of node bootstrapped
+                // otherwise it's possible to ruin the state
+                node.getState(data -> {
+                    // could be null if not bootstrapped
+                    if (data != null) {
                         storage.write(DHT_NODE_STATE_SAVE_KEY, data);
-                    });
-                }
+                    }
+                });
             }
         }
 

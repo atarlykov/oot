@@ -193,7 +193,7 @@ public class Tracker {
     String buildAnnounceUrl(String url)
     {
         return buildAnnounceUrl(
-                torrent.getClient().id, 0, torrent.metainfo.getInfohash(), url,
+                torrent.getClient().id, 0, torrent.metainfo.infohash, url,
                 /*torrent.downloaded, torrent.uploaded, torrent.left*/
                 0, 0, torrent.metainfo.length);
     }

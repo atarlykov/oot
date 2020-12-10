@@ -678,7 +678,7 @@ public class Torrent
             if (timeLastDHTUpdate + TORRENT_PEERS_DHT_UPDATE_TIMEOUT < now)
             {
                 timeLastDHTUpdate = now;
-                client.node.findPeers(metainfo.getInfohash(), this::addPeersFromAddresses);
+                client.node.findPeers(metainfo.infohash, this::addPeersFromAddresses);
             }
         }
     }
@@ -967,7 +967,7 @@ public class Torrent
 
         if (DEBUG) {
             long time = timeTorrentCompleted - timeTorrentStarted;
-            System.out.println(String.format("finished downloading: %s  time: %d sec",  metainfo.getInfohash().toString(), time/1000));
+            System.out.println(String.format("finished downloading: %s  time: %d sec",  metainfo.infohash.toString(), time/1000));
         }
     }
 

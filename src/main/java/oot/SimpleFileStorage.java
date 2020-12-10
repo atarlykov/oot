@@ -450,7 +450,7 @@ public class SimpleFileStorage extends Storage {
     private void writeState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
         try {
             Path state = root.resolve("state");
-            Path path = state.resolve(metainfo.getInfohash().toString());
+            Path path = state.resolve(metainfo.infohash.toString());
 
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             ObjectOutputStream os = new ObjectOutputStream(bos);
@@ -470,7 +470,7 @@ public class SimpleFileStorage extends Storage {
 
     private void readState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active, Consumer<Boolean> callback) {
         try {
-            Path path = root.resolve("state/" + metainfo.getInfohash().toString());
+            Path path = root.resolve("state/" + metainfo.infohash.toString());
             if (!Files.exists(path)) {
                 if (callback != null) {
                     callback.accept(false);

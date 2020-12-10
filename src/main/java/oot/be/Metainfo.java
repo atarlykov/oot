@@ -9,40 +9,49 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
+/**
+ * Torrents meta information as usually read from .torrent files
+ */
 public class Metainfo {
     /**
      * raw parsed metainfo  data as dictionary
      */
     private BEValue data;
+
     /**
      * SHA-1 digest of the 'info' value,
      * calculated during metainfo parsing
      */
-    private HashId infohash;
+    public final HashId infohash;
 
     /**
      * total bytes in torrent's data
      */
-    public long length;
+    public final long length;
     /**
      * size of each piece in bytes
      */
-    public long pieceLength;
+    public final long pieceLength;
     /**
      * total number of pieces,
      * calculated from length and pieceLength
      */
-    public long pieces;
+    public final long pieces;
 
-    // from announce url(s)
     /**
      * urls from announce-list if present
      * or just announce if not
      */
-    public List<List<String>> trackers = new ArrayList<>();
-    
+    public final List<List<String>> trackers = new ArrayList<>();
+
+    /**
+     * in case of multi-file mode this holds name
+     * of the root directory (suggestion)
+     */
+    public final String directory;
 
     /**
      * information about all files in metainfo
@@ -51,7 +60,7 @@ public class Metainfo {
         // length of file in bytes
         public long length;
         // path elements
-        public List<String> names = new ArrayList<>();
+        public List<String> names;
 
         public FileInfo(long length, List<String> names) {
             this.length = length;
@@ -60,26 +69,10 @@ public class Metainfo {
     }
 
     /**
-     * in case of multi-file mode this holds name
-     * of the root directory (suggestion)
-     */
-    public String directory = "";
-
-    /**
      * list of files in metainfo
      */
-    public List<FileInfo> files = new ArrayList<>();
+    public final List<FileInfo> files = new ArrayList<>();
 
-
-    /**
-     * parses buffer and calculates infohash
-     * @param buffer
-     */
-    public Metainfo(ByteBuffer buffer) {
-        BEParser parser = new BEParser();
-        data = parser.parse(buffer, this);
-        populate();
-    }
 
     /**
      * called by parser to calculate digest from the buffer
@@ -88,7 +81,8 @@ public class Metainfo {
      * @param end end position (exclusive)
      * @throws RuntimeException if SHA-1 is not available
      */
-    void digest(ByteBuffer buffer, int start, int end) {
+    private byte[] digest(ByteBuffer buffer, int start, int end)
+    {
         MessageDigest digest = null;
         try {
             digest = MessageDigest.getInstance("SHA-1");
@@ -99,10 +93,67 @@ public class Metainfo {
             throw new RuntimeException("SHA-1 is not available, can't work without it", e);
         }
 
-        infohash = HashId.wrap(digest.digest());
+        return digest.digest();
     }
 
-    // checks required data
+
+    /**
+     * service DTO class to simplify final semantics of metainfo fields,
+     * used during construction
+     */
+    private static class TempData {
+        private HashId infohash;
+        public long length;
+        public long pieceLength;
+        public long pieces;
+        public List<List<String>> trackers = new ArrayList<>();
+        public String directory;
+        public List<Metainfo.FileInfo> files = new ArrayList<>();
+    }
+
+    /**
+     * parses buffer and calculates infohash
+     * @param buffer to read data from
+     * @throws IllegalArgumentException if data could not be parsed or logically invalid
+     */
+    public Metainfo(ByteBuffer buffer)
+    {
+        // temp storage
+        TempData x = new TempData();
+
+        BEParser parser = new BEParser();
+        data = parser.parse(buffer, Set.of("info"), (String name, ByteBuffer tmp, int from, int to) -> {
+            byte[] digest = digest(tmp, from, to);
+            x.infohash = HashId.wrap(digest);
+        });
+        populate(x);
+
+        // copy temp to final fields
+        infohash = x.infohash;
+        length = x.length;
+        pieceLength = x.pieceLength;
+        pieces = x.pieces;
+        directory = x.directory;
+        files.addAll(x.files);
+        trackers.addAll(x.trackers);
+
+        if (!validate()) {
+            throw new IllegalArgumentException("torrent data is invalid");
+        }
+    }
+
+    /**
+     * @return true if this torrent contains more than one file
+     */
+    public boolean isMultiFile() {
+        return files.size() > 1;
+    }
+
+
+    /**
+     * checks meta information to be correct
+     * @return true if ok
+     */
     public boolean validate() {
         if (length <= 0) {
             return false;
@@ -116,43 +167,65 @@ public class Metainfo {
         return true;
     }
 
-    private void populate() {
+
+    /**
+     * service method to extract values from hierarchical BEValue dictionaries
+     * @param path path with dots as separators
+     * @return value of null if not found
+     */
+    private BEValue getValue(String path) {
+        String[] split = path.split("\\.");
+        BEValue dict = data;
+        for (int i = 0; i < split.length; i++) {
+            dict = dict.dictionary.get(split[i]);
+            if (dict == null) {
+                return null;
+            }
+        }
+        return dict;
+    }
 
 
+    /**
+     * populates this meta information from the decoded BE data,
+     * hardly uses all keys from the specification
+     */
+    private void populate(TempData data)
+    {
         BEValue beName = getValue("info.name");
         String name = new String(beName.bString, StandardCharsets.UTF_8);
 
         BEValue value = getValue("info.length");
         if (value != null) {
             // single file mode
-            length = value.integer;
+            data.length = value.integer;
             files.add(new FileInfo(value.integer, List.of(name)));
-            directory = null;
+            data.directory = null;
         } else {
             // multi file mode
-            length = 0;
-            directory = name;
+            data.length = 0;
+            data.directory = name;
             BEValue beFiles = getValue("info.files");
             for (BEValue beFile: beFiles.list) {
                 BEValue beLength = beFile.dictionary.get("length");
                 BEValue bePath = beFile.dictionary.get("path");
-                files.add(new FileInfo(
+                data.files.add(new FileInfo(
                         beLength.integer,
                         bePath.list.stream()
                                 .map(be -> new String(be.bString, StandardCharsets.UTF_8))
                                 .collect(Collectors.toList())
                 ));
-                length += beLength.integer;
+                data.length += beLength.integer;
             }
         }
 
         value = getValue("info.piece length");
         if ((value != null) && (value.isInteger())) {
-            pieceLength = value.integer;
+            data.pieceLength = value.integer;
         }
 
         if (0 < pieceLength) {
-            pieces = (length + pieceLength - 1) / pieceLength;
+            data.pieces = (data.length + data.pieceLength - 1) / data.pieceLength;
         }
 
         value = getValue("announce-list");
@@ -168,41 +241,14 @@ public class Metainfo {
                     }
                 }
                 if (!urls.isEmpty()) {
-                    trackers.add(urls);
+                    data.trackers.add(urls);
                 }
             }
         } else {
-            trackers.add(List.of(getAnnounce()));
+            BEValue announce = getValue("announce");
+            if (BEValue.isBString(announce)) {
+                data.trackers.add(List.of(new String(announce.bString, StandardCharsets.UTF_8)));
+            }
         }
-    }
-
-    public HashId getInfohash() {
-        return infohash;
-    }
-
-//    public MValue get(String name) {
-//    }
-//
-//    public MValue get(String name, int index) {
-//    }
-
-    public String getAnnounce() {
-        BEValue value = getValue("announce");
-        return new String(value.bString, StandardCharsets.UTF_8);
-    }
-
-
-    public BEValue getValue(String path) {
-        String[] split = path.split("\\.");
-        BEValue dict = data;
-        for (int i = 0; i < split.length; i++) {
-            BEValue beValue = dict.dictionary.get(split[i]);
-            dict = beValue;
-        }
-        return dict;
-    }
-
-    public boolean isMultiFile() {
-        return files.size() > 1;
     }
 }
