@@ -17,7 +17,7 @@ import java.util.Formatter;
 public abstract class PeerConnection
 {
     // debug switch
-    private static final boolean DEBUG = true;
+    private static final boolean DEBUG = false;
 
     /**
      * length of time period to aggregate downloaded and uploaded bytes,
@@ -85,7 +85,7 @@ public abstract class PeerConnection
 
     // number of data we must receive to have
     // the full long message (PIECE) in the buffer
-    int extendedReceiveBufferModeTailSize = 0;
+    int receiveBufferMessageTailSize = 0;
 
     int receiveBufferNormalLimit;
     int receiveBufferCompactionLimit;
@@ -353,13 +353,19 @@ public abstract class PeerConnection
      * reads data into the buffer and starts parsing and processing
      * of only fully received messages.
      * calls {@link PeerConnection#close(Peer.CloseReason)} ()} to drop the connection if read or parsing fails
+     * @return true if there is an incomplete message in the buffer, could be used to repeat read
      */
-    void receive()
+    boolean receive()
     {
         // due to method's agreement buffer here is always configured as:
         //  - .position: beginning of previously received data or zero if empty
         //  - .limit: end of the previously received data in buffer or zero
         ByteBuffer rb = recvBuffer;
+
+        if (DEBUG) {
+            System.out.println(System.nanoTime() + "  [receive]   enter:" + rb.position() + "," + rb.limit() +
+                    "  ext:" + extendedReceiveBufferMode + "  tail:" + receiveBufferMessageTailSize);
+        }
 
         // configure buffer to append data as:
         // .position - start to write data from
@@ -370,12 +376,14 @@ public abstract class PeerConnection
         if (!extendedReceiveBufferMode) {
             // in normal mode we use only part of the buffer
             // see {@link #receiveBufferNormalLimit}
+            if (DEBUG) System.out.println(System.nanoTime() + "  [receive]    !ext  limit->" + receiveBufferNormalLimit);
             rb.limit(receiveBufferNormalLimit);
         } else {
             // in extended mode allow to receive only
             // tail of the last long message,
             // mode is switched off only after successful receive
-            rb.limit(rb.position() + extendedReceiveBufferModeTailSize);
+            rb.limit(rb.position() + receiveBufferMessageTailSize);
+            if (DEBUG) System.out.println(System.nanoTime() + "  [receive]     ext  limit->" + (rb.position() + receiveBufferMessageTailSize));
         }
 
         // read
@@ -386,12 +394,10 @@ public abstract class PeerConnection
             // drop the connection
             if (DEBUG) System.out.println(peer.address + " error receiving data [3], " + e.getMessage());
             close(Peer.CloseReason.INACCESSIBLE);
-            return;
+            return false;
         }
 
-        if (DEBUG) {
-            //System.out.println(System.nanoTime() + "  [receive]   read:" + n + "  buf:" + rb.position() + "," + rb.limit());
-        }
+        if (DEBUG) System.out.println(System.nanoTime() + "  [receive]   read:" + n + "  buf:" + rb.position() + "," + rb.limit());
 
         if (n == -1)
         {
@@ -401,35 +407,47 @@ public abstract class PeerConnection
             // that could be connection close in case of seed-seed
             close(Peer.CloseReason.NORMAL);
             if (DEBUG) System.out.println(peer.address + " closed the connection [4]");
-            return;
+            return false;
         }
 
+        // flip buffer to read state with all data available
+        int limit = rb.position();
+        rb.position(position).limit(limit);
+
         if (n == 0) {
-            // no data available,
-            // reset buffer to default state
-            rb.position(0).limit(0);
-            return;
+            // no new data has been read,
+            // wait till the next turn
+            return false;
         }
 
         // track download speed
         rawStatistics.download.add(n);
 
-        // revert buffer to default state to work with data
-        int limit = rb.position();
-        rb.limit(limit);
-        rb.position(position);
+        // we have received another portion of data, but it's too small yet
+        // to finish the message (we know that), save state and return
+        if (n < receiveBufferMessageTailSize) {
+            receiveBufferMessageTailSize -= n;
+            return false;
+        }
+
+        if (DEBUG) System.out.println(System.nanoTime() + "  [receive]   proc:   buf:" + rb.position() + "," + rb.limit());
 
         // this must leave .position at the beginning
-        // of the unprocessed data
+        // of the last unprocessed data message
         int bytesToHaveFullMessage = processReceiveBuffer(rb);
         if (bytesToHaveFullMessage == -1) {
-            // reset buffer to default state
+            // parsing (protocol) error, reset buffer to default state
             rb.position(0).limit(0);
             close(Peer.CloseReason.PROTOCOL_ERROR);
-            return;
+            return false;
         }
-        // fix limit for possible errors in processing
+
+        // fix limit for possible errors in processing,
+        // can't fix position as we don't know number of messages processed
         rb.limit(limit);
+
+        // remember amount of data we need to have the next message
+        receiveBufferMessageTailSize = bytesToHaveFullMessage;
 
         if (!rb.hasRemaining()) {
             // we have processed the whole buffer, no data left...
@@ -437,6 +455,7 @@ public abstract class PeerConnection
             rb.position(0);
             rb.limit(0);
             extendedReceiveBufferMode = false;
+            return false;
         }
         else if (rb.remaining() <= receiveBufferCompactionLimit) {
             // only small data in the buffer (not like half of PIECE message),
@@ -445,12 +464,16 @@ public abstract class PeerConnection
             rb.limit(rb.position());
             rb.position(0);
             extendedReceiveBufferMode = false; // just in case
+            // indicate we are ready to re-read
+            return true;
         } else {
             // use upper part of the buffer to get the remaining part,
             // could be tested to find the optimum receiveBufferCompactionLimit
             // as system call vs copy
             extendedReceiveBufferMode = true;
-            extendedReceiveBufferModeTailSize = bytesToHaveFullMessage;
+            if (DEBUG) System.out.println("  ---- [EXTENDED] ----" + "  buf:" + rb.position() + "," + rb.limit());
+            // indicate we are ready to re-read
+            return true;
         }
     }
 
@@ -512,6 +535,9 @@ public abstract class PeerConnection
                 sendBuffer.position( position);
             }
 
+            if ((sendBuffer.remaining() == 0) && !hasMoreQueuedData) {
+                return 0;
+            }
 
             // send as much as possible & track raw upload speed
             int n = channel.write(sendBuffer);
@@ -530,7 +556,6 @@ public abstract class PeerConnection
             // set up selector if we have more data to send,
             if (hasMoreQueuedData || sendBuffer.hasRemaining()) {
                 sKey.interestOpsOr(SelectionKey.OP_WRITE);
-                System.out.println("  send() set OP_WRITE");
             }
 
             // keys are reset after select, so there is no need to reset here
@@ -584,7 +609,10 @@ public abstract class PeerConnection
             //if (DEBUG) System.out.println(System.nanoTime() + "   [channel ready] (enter)  ready:" + sKey.readyOps());
 
             if (sKey.isReadable()) {
-                receive();
+                boolean hasIncompleteMessage;
+                do {
+                    hasIncompleteMessage = receive();
+                } while (hasIncompleteMessage);
             }
 
             // key could become cancelled while handling receive,
