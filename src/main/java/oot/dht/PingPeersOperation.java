@@ -18,19 +18,19 @@ import java.util.function.Consumer;
  * uses the same transaction id for ping requests to different addresses
  * in bounds of one operation
  */
-class PingPeersOperation extends PingOperation {
+public class PingPeersOperation extends PingOperation {
 
     // peers to send ping queries too
-    private final List<InetSocketAddress> peers;
+    protected final List<InetSocketAddress> peers;
 
     // do we need to insert answered nodes into routing or update them if already exist
-    private final boolean updateRouting;
+    protected final boolean updateRouting;
 
     // optional consumer to be notified at the end of the operation
-    private final Consumer<List<RoutingTable.RemoteNode>> callback;
+    protected final Consumer<List<RoutingTable.RemoteNode>> callback;
 
     // collection of answered nodes, will be sent to callback consumer
-    private List<RoutingTable.RemoteNode> cbNodes;
+    protected List<RoutingTable.RemoteNode> cbNodes;
 
     /**
      * allowed constructor for a case of multi peers
@@ -73,7 +73,7 @@ class PingPeersOperation extends PingOperation {
     }
 
     @Override
-    boolean update()
+    protected boolean update()
     {
         if (Operation.MAX_SEND_ERRORS < errCounter) {
             // finish ping operation due to errors
@@ -115,7 +115,7 @@ class PingPeersOperation extends PingOperation {
     }
 
     @Override
-    boolean receive(InetSocketAddress address, BEValue response)
+    protected boolean receive(InetSocketAddress address, BEValue response)
     {
         // count answered peers
         recvCounter++;

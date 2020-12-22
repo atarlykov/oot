@@ -11,20 +11,20 @@ import java.util.function.Consumer;
  * Complex operation to searches for peers that stores
  * any specific torrent (hash)
  */
-class FindTorrentPeersOperation extends Operation
+public class FindTorrentPeersOperation extends Operation
 {
     /**
      * default timeout for operation to stop, in milliseconds
      */
-    static final long OPERATION_TIMEOUT = 64_000L;
+    public static final long OPERATION_TIMEOUT = 64_000L;
     /**
      * max number of iteration during search process
      */
-    private static final int MAX_ITERATIONS = 100;
+    public  static final int MAX_ITERATIONS = 100;
     /**
      * max number of closest nodes to use on each iteration
      */
-    private static final int MAX_NODES_FOR_ITERATION = 16;
+    public  static final int MAX_NODES_IN_ITERATION = 16;
 
     /**
      * target hash to search
@@ -32,37 +32,37 @@ class FindTorrentPeersOperation extends Operation
     private final HashId target;
 
     // tracks nodes we have sent request too
-    Set<RoutingTable.RemoteNode> queried;
+    protected Set<RoutingTable.RemoteNode> queried;
 
     // all peers found
-    Set<InetSocketAddress> peers;
+    protected Set<InetSocketAddress> peers;
 
     // nodes that are being queried on the current iteration
     //List<RoutingTable.RemoteNode> nodes;
 
     // nodes found on the current iteration
-    List<RoutingTable.RemoteNode> nodesFound;
+    protected List<RoutingTable.RemoteNode> nodesFound;
     // peers found on the current iteration
-    List<InetSocketAddress> peersFound;
+    protected List<InetSocketAddress> peersFound;
 
     // tracks iterations while searching for nearest nodes nodes -> nodes -> nodes -> ..
-    int iterationCounter;
+    protected int iterationCounter;
 
     // completion indicator for child operations
-    boolean callbackCalled;
+    protected boolean callbackCalled;
 
     // callback to be notified on finish
-    Consumer<Set<InetSocketAddress>> extCallback;
+    protected Consumer<Set<InetSocketAddress>> extCallback;
 
     // service list of distinct nodes for the next iteration
-    List<RoutingTable.RemoteNode> nodesDistinct;
+    protected List<RoutingTable.RemoteNode> nodesDistinct;
     // distances to distinct nodes
-    HashId[] nodesDistinctDistances;
+    protected HashId[] nodesDistinctDistances;
 
     /**
      * internal states of the operation
      */
-    private enum State {
+    protected enum State {
         // initial state
         START,
         // searching nodes close to own id
@@ -70,7 +70,7 @@ class FindTorrentPeersOperation extends Operation
     }
 
     // current state of the operation
-    private State state;
+    protected  State state;
 
     /**
      * allowed constructor
@@ -80,21 +80,36 @@ class FindTorrentPeersOperation extends Operation
      */
     public FindTorrentPeersOperation(Node _node, HashId _target, Consumer<Set<InetSocketAddress>> _extCallback)
     {
-        super(_node, System.currentTimeMillis(), OPERATION_TIMEOUT);
+        this(_node, _target, OPERATION_TIMEOUT, MAX_NODES_IN_ITERATION, _extCallback);
+    }
+
+    /**
+     * allowed constructor
+     * @param _node ref to local node
+     * @param _target target hash to search for
+     * @param _opTimeout custom timeout for operations
+     * @param _maxNodesInIteration max number of new nodes to try in each iteration
+     * @param _extCallback callback to call on finish
+     */
+    public FindTorrentPeersOperation(
+            Node _node, HashId _target,
+            long _opTimeout, int _maxNodesInIteration,
+            Consumer<Set<InetSocketAddress>> _extCallback)
+    {
+        super(_node, System.currentTimeMillis(), _opTimeout);
         target = _target;
         extCallback = _extCallback;
         queried = new HashSet<>();
         peers = new HashSet<>();
 
-        nodesDistinct = new ArrayList<>(MAX_NODES_FOR_ITERATION);
-        nodesDistinctDistances = new HashId[MAX_NODES_FOR_ITERATION];
+        nodesDistinct = new ArrayList<>(_maxNodesInIteration);
+        nodesDistinctDistances = new HashId[_maxNodesInIteration];
 
         state = State.START;
     }
 
-
     @Override
-    boolean update()
+    protected boolean update()
     {
         // global timeout protection
         if (timestamp + timeout < System.currentTimeMillis())

@@ -136,12 +136,12 @@ public class Node {
      * becomes bootstrapped, usually called only once,
      * bout could be called more times in case of start-stop-start-stop-.. sequence
      */
-    volatile Consumer<Void> callbackBootstrapped;
+    //volatile Consumer<Void> callbackBootstrapped;
 
     // indicates if this node has connection
     // to dht network or not, used to delay operations' requests,
     // doesn't need to be volatile
-    boolean bootstrapped = false;
+    volatile boolean bootstrapped = false;
 
     // transaction id for a new operation initiated by the local node
     // todo: extend to long (as received from the wild)
@@ -227,9 +227,16 @@ public class Node {
      * generates new unique id if state can't be parsed
      * @param state serialized state
      */
-    public Node(byte[] state) {
+    public Node(byte[] state)
+    {
         if (!restore(state)) {
             id = generateUniqueId();
+        }
+
+        if (routing.hasAliveNodes()) {
+            // this will not check nodes,
+            // only presence of records
+            bootstrapped = true;
         }
     }
 
@@ -242,32 +249,48 @@ public class Node {
     }
 
     /**
-     * registers announce callback to be notified when external announce message is received,
-     * callback will be called from the node executing thread
-     * @param callbackAnnounce callback
+     * @return true if node has been bootstrapped and ready to server requests
      */
-    public void setCallbackAnnounce(BiConsumer<HashId, InetSocketAddress> callbackAnnounce) {
-        this.callbackAnnounce = callbackAnnounce;
+    public boolean isBootstrapped() {
+        return bootstrapped;
     }
 
-    /**
-     * registers bootstrap callback to be notified when node becomes alive
-     * callback will be called from the node executing thread
-     * @param callbackBootstrapped callback
-     */
-    public void setCallbackBootstrapped(Consumer<Void> callbackBootstrapped) {
-        this.callbackBootstrapped = callbackBootstrapped;
-    }
+
+//    /**
+//     * registers announce callback to be notified when external announce message is received,
+//     * callback will be called from the node executing thread
+//     * @param callbackAnnounce callback
+//     */
+//    public void setCallbackAnnounce(BiConsumer<HashId, InetSocketAddress> callbackAnnounce) {
+//        this.callbackAnnounce = callbackAnnounce;
+//    }
+//
+//    /**
+//     * registers bootstrap callback to be notified when node becomes alive
+//     * callback will be called from the node executing thread
+//     * @param callbackBootstrapped callback
+//     */
+//    public void setCallbackBootstrapped(Consumer<Void> callbackBootstrapped) {
+//        this.callbackBootstrapped = callbackBootstrapped;
+//    }
 
     /**
      * starts bootstrap operation against the specified nodes
      * to populate the routing table and announce this node
      * @param seed list of initial addresses
      */
-    public void bootstrap(List<InetSocketAddress> seed) {
-        synchronized (extOperations) {
-            extOperations.add(new BootstrapOperation(this, seed, null));
-        }
+    public void bootstrap(List<InetSocketAddress> seed, Consumer<Boolean> _cbBootstrapped)
+    {
+        addExtOperation(new BootstrapOperation(this, seed, alive ->
+        {   // will be called in Node's thread
+
+            // update node state
+            this.bootstrapped = alive;
+
+            if (_cbBootstrapped != null) {
+                _cbBootstrapped.accept(alive);
+            }
+        }));
     }
 
     /**
@@ -276,9 +299,7 @@ public class Node {
      * @param hash torrent hash
      */
     public void announce(HashId hash) {
-        synchronized (extOperations) {
-            extOperations.add(new AnnounceTorrentOperation(this, hash));
-        }
+        addExtOperation(new AnnounceTorrentOperation(this, hash));
     }
 
     /**
@@ -288,9 +309,7 @@ public class Node {
      * @param callback callback to be notified
      */
     public void findPeers(HashId hash, Consumer<Set<InetSocketAddress>> callback) {
-        synchronized (extOperations) {
-            extOperations.add(new FindTorrentPeersOperation(this, hash, callback));
-        }
+        addExtOperation(new FindTorrentPeersOperation(this, hash, callback));
     }
 
     /**
@@ -300,9 +319,7 @@ public class Node {
      * @param callback callback to be notified with the state of the node
      */
     public void getState(Consumer<byte[]> callback) {
-        synchronized (extOperations) {
-            extOperations.add(new GetNodeStateOperations(this, callback));
-        }
+        addExtOperation(new GetNodeStateOperations(this, callback));
     }
 
     /**
@@ -328,8 +345,9 @@ public class Node {
     /**
      * starts separate thread to maintain this node
      * and run operations
+     * @param runBootstrap will run bootstrap operation oif true and there known addresses
      */
-    public synchronized void start() throws IOException
+    public synchronized void start(boolean runBootstrap) throws IOException
     {
         if (thread != null) {
             // already started
@@ -341,12 +359,14 @@ public class Node {
 
         // run background service
         thread = new NodeThread(10);
-        thread.setDaemon(false);
+        thread.setDaemon(true);
         thread.start();
 
-        // initiate bootstrap process in any case,
+        // initiate bootstrap process in case there are known addresses,
         // this will update remote nodes if exist
-        addOperation(new BootstrapOperation(this, null, null));
+        if (runBootstrap && routing.hasAliveNodes()) {
+            addOperation(new BootstrapOperation(this, null, null));
+        }
     }
 
 
@@ -419,17 +439,33 @@ public class Node {
      * generates next transactions id
      * @return next transaction id
      */
-    private short nextTransactionId() {
+    protected short nextTransactionId() {
         return transaction++;
     }
 
     /**
-     * adds operation to the list of active operations for execution
+     * internal method to add operations to the list
+     * of active operations for execution,
+     * NOTE: MUST be called in bound of the execution thread (update
+     * method, inside other operations, etc.)
+     * NODE: #ad
      * @param operation operation
      */
-    void addOperation(Operation operation) {
+    protected void addOperation(Operation operation) {
         operation.setTransaction(nextTransactionId());
         operations.add(operation);
+    }
+
+    /**
+     * add operations to the list of active operations for execution,
+     * could be called by any thread, will safely transfer operation
+     * to the execution collection
+     * @param operation new operation
+     */
+    public void addExtOperation(Operation operation) {
+        synchronized (extOperations) {
+            extOperations.add(operation);
+        }
     }
 
     /**
@@ -451,7 +487,7 @@ public class Node {
             extOperations.clear();
         }
 
-        // let all active operations to proceed
+        // let all active operations proceed
         for (int i = operations.size() - 1; 0 <= i; i--) {
             Operation operation = operations.get(i);
             boolean done = operation.update();

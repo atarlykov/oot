@@ -11,7 +11,7 @@ import java.util.function.Consumer;
  * 1. fresh start that needs neighbours search
  * 2. reload that must only publish itself (search new neighbours too??)
  */
-class BootstrapOperation extends FindCloseNodesOperation {
+public class BootstrapOperation extends FindCloseNodesOperation {
     /**
      * max number of search iterations
      */
@@ -19,7 +19,7 @@ class BootstrapOperation extends FindCloseNodesOperation {
     /**
      * default timeout for bootstrap operation to stop, in milliseconds
      */
-    static final long OPERATION_TIMEOUT = 64_000L;
+    public static final long OPERATION_TIMEOUT = 64_000L;
 
     /**
      * allowed constructor
@@ -31,21 +31,6 @@ class BootstrapOperation extends FindCloseNodesOperation {
      *                     if routing has active nodes in it and false otherwise
      */
     public BootstrapOperation(Node _node, List<InetSocketAddress> _seed, Consumer<Boolean> _extCallback) {
-        super(_node, _node.id, (alive) ->
-        {
-            // will be called via Node's thread
-            if (alive) {
-                // notify callback if it's the 1st bootstrap
-                Consumer<Void> cbBootstrapped = _node.callbackBootstrapped;
-                if (!_node.bootstrapped && (cbBootstrapped != null)) {
-                    cbBootstrapped.accept(null);
-                }
-                // update state
-                _node.bootstrapped = true;
-            }
-            if (_extCallback != null) {
-                _extCallback.accept(alive);
-            }
-        }, OPERATION_TIMEOUT, MAX_ITERATIONS, _seed);
+        super(_node, _node.id, _extCallback, OPERATION_TIMEOUT, MAX_ITERATIONS, _seed);
     }
 }
