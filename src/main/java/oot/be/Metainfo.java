@@ -190,7 +190,7 @@ public class Metainfo {
      * populates this meta information from the decoded BE data,
      * hardly uses all keys from the specification
      */
-    private void populate(TempData data)
+    private void populate(TempData temp)
     {
         BEValue beName = getValue("info.name");
         String name = new String(beName.bString, StandardCharsets.UTF_8);
@@ -198,34 +198,35 @@ public class Metainfo {
         BEValue value = getValue("info.length");
         if (value != null) {
             // single file mode
-            data.length = value.integer;
+            temp.length = value.integer;
             files.add(new FileInfo(value.integer, List.of(name)));
-            data.directory = null;
+            temp.directory = null;
         } else {
             // multi file mode
-            data.length = 0;
-            data.directory = name;
+            temp.length = 0;
+            temp.directory = name;
             BEValue beFiles = getValue("info.files");
             for (BEValue beFile: beFiles.list) {
                 BEValue beLength = beFile.dictionary.get("length");
                 BEValue bePath = beFile.dictionary.get("path");
-                data.files.add(new FileInfo(
+                temp.files.add(new FileInfo(
                         beLength.integer,
                         bePath.list.stream()
                                 .map(be -> new String(be.bString, StandardCharsets.UTF_8))
                                 .collect(Collectors.toList())
                 ));
-                data.length += beLength.integer;
+                temp.length += beLength.integer;
             }
         }
 
         value = getValue("info.piece length");
-        if ((value != null) && (value.isInteger())) {
-            data.pieceLength = value.integer;
+
+        if (BEValue.isInteger(value)) {
+            temp.pieceLength = value.integer;
         }
 
-        if (0 < pieceLength) {
-            data.pieces = (data.length + data.pieceLength - 1) / data.pieceLength;
+        if (0 < temp.pieceLength) {
+            temp.pieces = (temp.length + temp.pieceLength - 1) / temp.pieceLength;
         }
 
         value = getValue("announce-list");
@@ -241,13 +242,13 @@ public class Metainfo {
                     }
                 }
                 if (!urls.isEmpty()) {
-                    data.trackers.add(urls);
+                    temp.trackers.add(urls);
                 }
             }
         } else {
             BEValue announce = getValue("announce");
             if (BEValue.isBString(announce)) {
-                data.trackers.add(List.of(new String(announce.bString, StandardCharsets.UTF_8)));
+                temp.trackers.add(List.of(new String(announce.bString, StandardCharsets.UTF_8)));
             }
         }
     }
