@@ -54,6 +54,7 @@ public class StdPeerMessageCache {
 
         pm.block = null;
         pm.params = null;
+        // todo: remove sync?
         synchronized (cache) {
             if (cache.size() < CACHE_SIZE) {
                 cache.offerFirst(pm);
@@ -104,12 +105,13 @@ public class StdPeerMessageCache {
         return pm;
     }
 
-    public StdPeerMessage piece(int index, int begin, int length, ByteBuffer block) {
+    public StdPeerMessage piece(int index, int begin, int length, ByteBuffer buffer, Object param) {
         StdPeerMessage pm = getInstance(StdPeerMessage.PIECE);
         pm.index = index;
         pm.begin = begin;
         pm.length = length;
-        pm.block = block;
+        pm.block = buffer;
+        pm.params = param;
         return pm;
     }
 
@@ -117,7 +119,7 @@ public class StdPeerMessageCache {
         StdPeerMessage pm = getInstance(StdPeerMessage.BITFIELD);
         pm.index = pieces;
         pm.params = new Object[1];
-        pm.params[0] = state;
+        pm.params = state;
 
         return pm;
     }
@@ -135,9 +137,10 @@ public class StdPeerMessageCache {
     public StdPeerMessage handshake(HashId torrent, HashId peer)
     {
         StdPeerMessage pm = getInstance(StdPeerMessage.HANDSHAKE);
-        pm.params = new Object[2];
-        pm.params[0] = torrent;
-        pm.params[1] = peer;
+        HashId[] params = new HashId[2];
+        params[0] = torrent;
+        params[1] = peer;
+        pm.params = params;
         return pm;
     }
 

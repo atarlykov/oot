@@ -1,6 +1,5 @@
 package oot.poc;
 
-import oot.PeerProtocol;
 import oot.dht.HashId;
 
 import java.nio.ByteBuffer;
@@ -15,7 +14,7 @@ import java.util.Map;
 public class StdPeerProtocol {
 
     // debug switch
-    private static final boolean DEBUG = true;
+    private static final boolean DEBUG = false;
 
     /**
      * fixed identification of the protocol, fixed by the specification,
@@ -123,6 +122,7 @@ public class StdPeerProtocol {
         buffer.get(hash);
         buffer.get(id);
 
+        if (DEBUG) System.out.println("RCVD: handshake");
         pc.onHandshake(reserved, HashId.wrap(hash), HashId.wrap(id));
 
         return true;
@@ -283,7 +283,7 @@ public class StdPeerProtocol {
 
         // check if notified party has correctly read the data
         if ((position + length - 8) != buffer.position()) {
-            if (DEBUG) System.out.println("pc.onPiece() hasn't read all data from the buffer");
+            //if (DEBUG) System.out.println("pc.onPiece() hasn't read all data from the buffer, recovering...");
             // recover correct position
             buffer.position(position + length - 8);
         }
@@ -300,8 +300,8 @@ public class StdPeerProtocol {
      * @param length length of the message as read from the buffer
      * @return true on success parsing and false on possible errors (must be logged)
      */
-    static boolean processMessage(StdPeerConnection pc, ByteBuffer buffer, int length) {
-
+    static boolean processMessage(StdPeerConnection pc, ByteBuffer buffer, int length)
+    {
         if (length == 0) {
             // keep alive message are non-standard, without a type
             pc.onKeepAlive();
@@ -310,8 +310,7 @@ public class StdPeerProtocol {
 
         // read type of the message
         byte type = buffer.get();
-
-        //System.out.println("RCVD   type:" + type + "    length: " + length);
+        if (DEBUG) System.out.println("RCVD   type:" + type + "    length: " + length);
 
         // decrease length to exclude message type
         length -= 1;
@@ -379,6 +378,7 @@ public class StdPeerProtocol {
                     return false;
                 }
                 buffer.putInt(0);
+                if (DEBUG) System.out.println("SEND:   type: ka");
                 return true;
 
             case StdPeerMessage.CHOKE:
@@ -390,6 +390,7 @@ public class StdPeerProtocol {
                 }
                 buffer.putInt(1);
                 buffer.put(pm.type);
+                if (DEBUG) System.out.println("SEND:   type:" + pm.type);
                 return true;
 
             case StdPeerMessage.HAVE:
@@ -399,6 +400,7 @@ public class StdPeerProtocol {
                 buffer.putInt(5);
                 buffer.put(pm.type);
                 buffer.putInt(pm.index);
+                if (DEBUG) System.out.println("SEND:   type: have    " + pm.index);
                 return true;
 
             case StdPeerMessage.REQUEST:
@@ -411,6 +413,7 @@ public class StdPeerProtocol {
                 buffer.putInt(pm.index);
                 buffer.putInt(pm.begin);
                 buffer.putInt(pm.length);
+                if (DEBUG) System.out.println("SEND:   type:" + pm.type + "    " + pm.index + " " + pm.begin + " " + pm.length);
                 return true;
 
             case StdPeerMessage.PORT:
@@ -420,15 +423,18 @@ public class StdPeerProtocol {
                 buffer.putInt(3);
                 buffer.put(pm.type);
                 buffer.putShort((short)pm.index);
+                if (DEBUG) System.out.println("SEND:   type: port    " + pm.index);
                 return true;
 
             case StdPeerMessage.BITFIELD:
+                if (DEBUG) System.out.println("SEND:   type: bitfield");
                 return populateBitfield(buffer, pm);
 
             case StdPeerMessage.PIECE:
                 return populatePiece(buffer, pm);
 
             case StdPeerMessage.HANDSHAKE:
+                if (DEBUG) System.out.println("SEND:   type: handshake");
                 return populateHandshake(buffer, pm);
 
             default:
@@ -450,7 +456,7 @@ public class StdPeerProtocol {
 
         // this has minimal size to contain all set bits
         // in little ending format
-        BitSet pieces = (BitSet) pm.params[0];
+        BitSet pieces = (BitSet) pm.params;
         byte[] data = pieces.toByteArray();
 
         if (buffer.remaining() < 5 + bytes) {
@@ -492,6 +498,7 @@ public class StdPeerProtocol {
         buffer.putInt(pm.index);
         buffer.putInt(pm.begin);
         buffer.put(pm.block);
+        if (DEBUG) System.out.println("SEND:   type: piece    " + pm.index + " " + pm.begin + " " + pm.length);
         return true;
     }
 
@@ -503,8 +510,9 @@ public class StdPeerProtocol {
      */
     static boolean populateHandshake(ByteBuffer buffer, StdPeerMessage pm)
     {
-        HashId infohash = (HashId) pm.params[0];
-        HashId peerId = (HashId) pm.params[1];
+        HashId[] params = (HashId[]) pm.params;
+        HashId infohash = params[0];
+        HashId peerId = params[1];
             
         if (buffer.remaining() < 1 + 19 + 8 + 20 + 20) {
             return false;

@@ -64,7 +64,7 @@ public class StdPeerMessage {
     // optional parameters, used only with some messages,
     // this consumes less memory than optional fields anyway,
     // cleared on return to the buffer
-    Object[] params;
+    Object params;
 
     /**
      * minimal allowed constructor

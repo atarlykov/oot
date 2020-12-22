@@ -1,12 +1,11 @@
 package oot.poc;
 
-import oot.Torrent;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
+import java.util.BitSet;
 import java.util.Formatter;
 
 /**
@@ -94,7 +93,6 @@ public abstract class PeerConnection
 
     int sendBufferNormalLimit;
     int sendBufferCompactionLimit;
-    boolean sendHasMoreData;
 
     /**
      * tracks connected status to allow
@@ -106,7 +104,8 @@ public abstract class PeerConnection
      */
     public long timeConnected;
 
-
+    // parent torrent we are downloading/uploading pieces for
+    final Torrent torrent;
 
     /**
      * various per connection statistics
@@ -143,13 +142,15 @@ public abstract class PeerConnection
      * @param _sendBufferCompactionLimit
      */
     public PeerConnection(
-            Selector _selector, Peer _peer,
+            Selector _selector,
+            Torrent _torrent, Peer _peer,
             ByteBuffer _receiveBuffer,
             int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
             ByteBuffer _sendBuffer,
             int _sendBufferNormalLimit, int _sendBufferCompactionLimit)
     {
         selector = _selector;
+        torrent = _torrent;
         peer = _peer;
 
         recvBuffer = _receiveBuffer;
@@ -187,6 +188,18 @@ public abstract class PeerConnection
     }
 
     /**
+     * could be used to prevent dropping of the connection while it finishes download
+     * @return true if there are some data we are waiting for
+     */
+    abstract boolean isDownloading();
+
+    /**
+     *
+     * @return current state of pieces available in the side of the peer
+     */
+    abstract BitSet getPeerPieces();
+
+    /**
      * integration method for parent torrent, allows to make
      * back call with parameters of blocks that should be downloaded
      * by this connection
@@ -196,6 +209,17 @@ public abstract class PeerConnection
      * @param length length of the block / usually fixed
      */
     abstract void enqueueBlockRequest(int index, int position, int length);
+
+    /**
+     * integration method for parent torrent, allows to make
+     * back calls with data loaded from a storage and ready to be sent to a peer
+     * @param buffer buffer with data ready to be read
+     * @param index index of the piece that holds the block
+     * @param position position in of the block to request / usually as (block index << 14)
+     * @param length length of the block / usually fixed
+     * @param params optional parameters
+     */
+    abstract void enqueuePiece(ByteBuffer buffer, int index, int position, int length, Object params);
 
     /**
      * default lifecycle
@@ -213,7 +237,6 @@ public abstract class PeerConnection
             }
         }
     }
-
 
     /**
      * resets state of this connection to allow
@@ -270,8 +293,9 @@ public abstract class PeerConnection
         if (established) {
             // ok, connection has been established,
             // initiate registration and other actions
-            // (registration is internally synchronized)
-            sKey = channel.register(selector, SelectionKey.OP_READ, this);
+            // (registration is internally synchronized),
+            // we need WRITE here to initiate 1st message (handshake) send from queue
+            sKey = channel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE, this);
             // store time for connection management
             timeConnected = System.currentTimeMillis();
 
@@ -357,7 +381,7 @@ public abstract class PeerConnection
         // read
         int n;
         try {
-            n = channel.read(recvBuffer);
+            n = channel.read(rb);
         } catch (IOException e) {
             // drop the connection
             if (DEBUG) System.out.println(peer.address + " error receiving data [3], " + e.getMessage());
@@ -365,16 +389,25 @@ public abstract class PeerConnection
             return;
         }
 
-        if (n == -1) {
+        if (DEBUG) {
+            //System.out.println(System.nanoTime() + "  [receive]   read:" + n + "  buf:" + rb.position() + "," + rb.limit());
+        }
+
+        if (n == -1)
+        {
+            // reset buffer to default state
+            rb.position(0).limit(0);
             // end of stream, close connection
             // that could be connection close in case of seed-seed
-            if (DEBUG) System.out.println(peer.address + " closed the connection [4]");
             close(Peer.CloseReason.NORMAL);
+            if (DEBUG) System.out.println(peer.address + " closed the connection [4]");
             return;
         }
 
         if (n == 0) {
-            // not data available
+            // no data available,
+            // reset buffer to default state
+            rb.position(0).limit(0);
             return;
         }
 
@@ -390,20 +423,22 @@ public abstract class PeerConnection
         // of the unprocessed data
         int bytesToHaveFullMessage = processReceiveBuffer(rb);
         if (bytesToHaveFullMessage == -1) {
+            // reset buffer to default state
+            rb.position(0).limit(0);
             close(Peer.CloseReason.PROTOCOL_ERROR);
             return;
         }
         // fix limit for possible errors in processing
         rb.limit(limit);
 
-        if (rb.position() == rb.limit()) {
+        if (!rb.hasRemaining()) {
             // we have processed the whole buffer, no data left...
             // just reset the buffer to start from the beginning
             rb.position(0);
             rb.limit(0);
             extendedReceiveBufferMode = false;
         }
-        else if (rb.limit() - rb.position() <= receiveBufferCompactionLimit) {
+        else if (rb.remaining() <= receiveBufferCompactionLimit) {
             // only small data in the buffer (not like half of PIECE message),
             // so compact the buffer
             rb.compact();
@@ -492,12 +527,16 @@ public abstract class PeerConnection
                 sendBuffer.compact();
             }
 
-            // set up selector if we have more data to send
+            // set up selector if we have more data to send,
             if (hasMoreQueuedData || sendBuffer.hasRemaining()) {
                 sKey.interestOpsOr(SelectionKey.OP_WRITE);
-            } else {
-                sKey.interestOpsAnd(~SelectionKey.OP_WRITE);
+                System.out.println("  send() set OP_WRITE");
             }
+
+            // keys are reset after select, so there is no need to reset here
+            //else {
+            //    sKey.interestOpsAnd(~SelectionKey.OP_WRITE);
+            //}
 
             return n;
         } catch (IOException e) {
@@ -508,37 +547,74 @@ public abstract class PeerConnection
     }
 
     /**
-     * convenient method for implementation to indicate it has data to send
+     * called by this class during processing to find of there are more
+     * data available to be sent and it's necessary to schedule send operation
+     * with help WRITE interest for the selector
+     * @return true if there are more data
      */
-    void setSendHasMoreData() {
-        sendHasMoreData = true;
+    abstract protected boolean hasEnqueuedDate();
+
+    /**
+     * could be used by a child class to schedule send operation,
+     * must be used when new data appears outside the {@link #onChannelReady()} call
+     */
+    protected void registerWriteInterest()
+    {
+        if ((sKey != null) && sKey.isValid() && hasEnqueuedDate()) {
+            sKey.interestOpsOr(SelectionKey.OP_WRITE);
+        }
     }
+
 
     /**
      * facade method to simplifies calling side, calls IO operation in the channel
      * called when peer's channel is ready for IO operations
+     *
+     * NOTE: it is possible to enter with sKey.readyOps() == 0
      */
     void onChannelReady()
     {
-        if (sKey.isReadable()) {
-            receive();
-        }
+        try {
+            // key could become cancelled but there could be
+            // async notifications from running thread
+            if (!sKey.isValid()) {
+                return;
+            }
 
-        // key could become cancelled while handling receive,
-        // connections could be dropped or io error raised
-        if (!sKey.isValid()) {
-            return;
-        }
+            //if (DEBUG) System.out.println(System.nanoTime() + "   [channel ready] (enter)  ready:" + sKey.readyOps());
 
-        if (sKey.isWritable()) {
-            // we were interested in data, send it
-            send();
-        } else if (sendHasMoreData) {
-            // seems we weren't interested, but some
-            // data has appeared, wait for the next round
-            sKey.interestOpsOr(SelectionKey.OP_WRITE);
-            // reset flag as data pack will be processed ny send()
-            sendHasMoreData = false;
+            if (sKey.isReadable()) {
+                receive();
+            }
+
+            // key could become cancelled while handling receive,
+            // connections could be dropped or io error raised
+            if (!sKey.isValid()) {
+                return;
+            }
+
+            if (sKey.isWritable()) {
+                // we were interested in data, send it
+                // this will register write interest in there is any data
+                send();
+            }
+
+            // it's possible to enter method with readyOps == 0,
+            // so we need to repeat WRITE interest
+            if (hasEnqueuedDate()) {
+                // seems we weren't interested, but some
+                // data has appeared, wait for the next round
+                sKey.interestOpsOr(SelectionKey.OP_WRITE);
+            }
+
+            // always indicate (set back) read interest as it could be
+            // dropped in *select* thread
+            sKey.interestOpsOr(SelectionKey.OP_READ);
+
+            //if (DEBUG) System.out.println(System.nanoTime() + "   [channel ready] (exit)  interested:" + sKey.interestOps());
+        } catch (Exception e) {
+            e.printStackTrace();
+            close(Peer.CloseReason.PROTOCOL_ERROR);
         }
     }
 

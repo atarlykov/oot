@@ -4,16 +4,14 @@ import oot.PeerMessage;
 import oot.dht.HashId;
 
 import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
-import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Formatter;
 import java.util.List;
 import java.util.stream.Stream;
 
-abstract class StdPeerConnection extends PeerConnection
+class StdPeerConnection extends PeerConnection
 {
     // debug switch
     private static final boolean DEBUG = true;
@@ -27,6 +25,8 @@ abstract class StdPeerConnection extends PeerConnection
      * timeout for outgoing request to wait for answer,
      * will be dropped and resent on timeout (to the same or
      * any other peer), milliseconds
+     * NOTE: highly related to QUEUE size as pieces/blocks
+     * could be received too slow
      */
     public static final int DOWNLOAD_QUEUE_REQUESTS_TIMEOUT = 16_000;
     /**
@@ -79,54 +79,9 @@ abstract class StdPeerConnection extends PeerConnection
      */
 
     /**
-     * max size of the data requested with PIECE message,
-     * affects buffers (move to upper level?)
-     */
-    public static final int PIECE_BLOCK_MAX_SIZE = 16 << 10;
-    /**
-     * number of byte in PIECE message prefix (before data)
-     * 4b length, 1b type, 2*4b params
-     */
-    public static final int MSG_PIECE_PREFIX_LENGTH = 13;
-
-    /**
      * handshake message size
      */
     public static final int MSG_HANDSHAKE_LENGTH = 20 + 8 + 20 + 20;
-
-    /**
-     * size of the receive buffer, it MUST be more than
-     * size of the max allowed PIECE message plus some
-     * operational space for small messages..
-     * but seems it's best to size it to allow receive several
-     * small messages and one PIECE inside first part (normal mode).
-     * that could work well when pieces are mixed with small messages
-     */
-    public static final int RECV_BUFFER_SIZE = 256 + 2 * PIECE_BLOCK_MAX_SIZE;
-    public static final int SEND_BUFFER_SIZE = 256 + 2 * PIECE_BLOCK_MAX_SIZE;
-
-    /**
-     * max allowed space of the receive buffer to be used in normal mode,
-     * tail space must allow writing of max (PIECE - 1)
-     */
-    public static final int RECV_BUFFER_NORMAL_LIMIT = RECV_BUFFER_SIZE - PIECE_BLOCK_MAX_SIZE - MSG_PIECE_PREFIX_LENGTH;
-    public static final int SEND_BUFFER_NORMAL_LIMIT = SEND_BUFFER_SIZE - PIECE_BLOCK_MAX_SIZE - MSG_PIECE_PREFIX_LENGTH;
-
-    /**
-     * amount of data in buffer to allow it's compaction (copy data to the beginning),
-     * mostly to copy small parts of data
-     */
-    public static final int SEND_BUFFER_COMPACT_LIMIT = 128; // could be == MSG_PIECE_PREFIX_LENGTH;
-
-
-
-    /**
-     * ref to the parent peer
-     */
-    Peer peer;
-
-    // parent torrent we are downloading/uploading pieces for
-    Torrent torrent;
 
     // pieces available at the other end (external peer)
     BitSet peerPieces = new BitSet();
@@ -191,7 +146,7 @@ abstract class StdPeerConnection extends PeerConnection
     /**
      * various per connection statistics
      */
-    PeerConnectionStatistics statistics;
+    PeerConnectionStatistics statistics = new PeerConnectionStatistics(60, 1000);
 
     /**
      * download speed limit in bytes/sec or zero if unlimited,
@@ -210,8 +165,11 @@ abstract class StdPeerConnection extends PeerConnection
      */
     long speedLimitUpload;
 
-    // todo: move is somewhere// ThreadLocal --> pass with all calls???
-    StdPeerMessageCache pmCache = new StdPeerMessageCache();
+    /**
+     * ref to instance of messages' cache,
+     * could be removed what inline classes are available
+     */
+    StdPeerMessageCache pmCache;
 
     public StdPeerConnection(
             Selector _selector,
@@ -219,18 +177,19 @@ abstract class StdPeerConnection extends PeerConnection
             ByteBuffer _receiveBuffer,
             int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
             ByteBuffer _sendBuffer,
-            int _sendBufferNormalLimit, int _sendBufferCompactionLimit)
+            int _sendBufferNormalLimit, int _sendBufferCompactionLimit,
+            StdPeerMessageCache _pmCache)
     {
-        super(_selector, _peer,
+        super(_selector, _torrent, _peer,
                 _receiveBuffer, _receiveBufferNormalLimit, _receiveBufferCompactionLimit,
                 _sendBuffer, _sendBufferNormalLimit, _sendBufferCompactionLimit);
 
-        torrent = _torrent;
+        pmCache = _pmCache;
     }
 
 
     /**
-     * add another message to the send queue for sending when channel is ready,
+     * adds another message to the send queue for sending when channel is ready,
      * notifies parent torrent if there are enqueued blocks that could be unlocked,
      * first message is at index [0]
      *
@@ -240,6 +199,14 @@ abstract class StdPeerConnection extends PeerConnection
      */
     protected void enqueue(StdPeerMessage message)
     {
+        if (DEBUG) {
+            if (message.type == StdPeerMessage.REQUEST) {
+                System.out.println("[stdpc] enqueue: req " + message.index + "  " + (message.begin >> 14));
+            } else {
+                System.out.println("[stdpc] enqueue: " + message.type);
+            }
+        }
+
         if (message.type == StdPeerMessage.CHOKE)
         {
             // remove reply messages with piece (block) data
@@ -248,7 +215,8 @@ abstract class StdPeerConnection extends PeerConnection
                 StdPeerMessage pm = sendQueue.get(i);
                 if (pm.type == StdPeerMessage.PIECE) {
                     sendQueue.remove(i);
-                    torrent.releaseBlock(pm);
+                    TorrentStorage.Block block = (TorrentStorage.Block) message.params;
+                    block.release();
                     pmCache.release(pm);
                 }
             }
@@ -292,19 +260,30 @@ abstract class StdPeerConnection extends PeerConnection
             // enqueue message
             sendQueue.add(message);
         }
-
-        // indicate we are ready to send data via channel
-        setSendHasMoreData();
     }
 
 
-
+    @Override
+    protected boolean hasEnqueuedDate() {
+        return !sendQueue.isEmpty();
+    }
 
     @Override
-    void update() {
+    void update()
+    {
+        // call update logic
+        _update();
+        // and check if there are new messages to be sent
+        registerWriteInterest();
+    }
 
-        // let base connection to perform
-        // base tasks
+    /**
+     * internal update logic
+     */
+    private void _update()
+    {
+        // let base connection to perform connecting phase
+        // and call onConnectionEstablished
         super.update();
 
         // wait for handshake to be received,
@@ -327,16 +306,18 @@ abstract class StdPeerConnection extends PeerConnection
         // todo: run keep alive
 
         // seed mode, decide if we still want to upload
-        // to this connection (logic placed in Torrent#onRequest)
+        // to this connection
         if (torrent.completed && interested) {
             enqueue(pmCache.notInterested());
             return;
         }
 
-        //
-        // download / upload mode
-        if (torrent.interested(peerPieces)) {
-            // peer has pieces missing on our side
+        // download / upload mode,
+        // run quick check for missing pieces (not blocks)
+        if (torrent.interested(peerPieces))
+        {
+            // peer has pieces missing on our side and
+            // no connection is downloading them
             if (!interested) {
                 // indicate our interest if not at the moment
                 enqueue(pmCache.interested());
@@ -348,7 +329,13 @@ abstract class StdPeerConnection extends PeerConnection
             return;
         }
         else {
-            // remote peer doesn't have pieces we are interested in
+            // remote peer doesn't have pieces we are interested in,
+            // but we could still be receiving requested pieces
+            if (!blockRequests.isEmpty()) {
+                // wait for blocks to be received or cancelled
+                return;
+            }
+
             if (!peerInterested) {
                 // other side not interested in us too, disconnect
                 close(Peer.CloseReason.NORMAL);
@@ -388,6 +375,16 @@ abstract class StdPeerConnection extends PeerConnection
     }
 
 
+    @Override
+    boolean isDownloading() {
+        return (0 < getActiveBlockRequestsNumber());
+    }
+
+    @Override
+    BitSet getPeerPieces() {
+        return peerPieces;
+    }
+
     /**
      * integration method for parent torrent, allows to make
      * back call with parameters of blocks that should be downloaded
@@ -403,6 +400,41 @@ abstract class StdPeerConnection extends PeerConnection
     @Override
     void enqueueBlockRequest(int index, int position, int length) {
         enqueue(pmCache.request(index, position, length));
+    }
+
+    /**
+     * integration method for parent torrent, allows to make
+     * back calls with data loaded from a storage and ready to be sent to a peer
+     *
+     * CALLED by parent torrent only
+     *
+     * @param buffer buffer with data ready to be read
+     * @param index index of the piece that holds the block
+     * @param position position in of the block to request / usually as (block index << 14)
+     * @param length length of the block / usually fixed
+     */
+    @Override
+    void enqueuePiece(ByteBuffer buffer, int index, int position, int length, Object params)
+    {
+        boolean found = false;
+
+        // check for the active linked peer request and remove it
+        for (int i = 0; i < peerBlockRequests.size(); i++) {
+            StdPeerMessage pm = peerBlockRequests.get(i);
+            if ((pm.index == index)
+                    && (pm.begin == position)
+                    && (pm.length == length))
+            {
+                blockRequests.remove(i);
+                pmCache.release(pm);
+                found = true;
+                break;
+            }
+        }
+        if (!found && DEBUG) {
+            System.out.println("torrent.enqueuePiece: pBR not found (cancelled?): " + index + " " + position + " " + length);
+        }
+        enqueue(pmCache.piece(index, position, length, buffer, params));
     }
 
     /**
@@ -451,9 +483,10 @@ abstract class StdPeerConnection extends PeerConnection
             int allocated = torrent.enqueueBlockRequests(this, this.peerPieces, requests);
             if (allocated == 0) {
                 // seems this connection has no more data for us,
-                // set "not interested" for now, could be dropped later
-                // on timeout dependent on completion (todo)
-                enqueue(pmCache.notInterested());
+                // but could still have active requests
+                if (enqueued == 0) {
+                    enqueue(pmCache.notInterested());
+                }
             }
         }
     }
@@ -470,7 +503,7 @@ abstract class StdPeerConnection extends PeerConnection
         long now = System.currentTimeMillis();
         for (int i = blockRequests.size() - 1; 0 <= i; i--) {
             StdPeerMessage pm = blockRequests.get(i);
-            if (DOWNLOAD_QUEUE_REQUESTS_TIMEOUT < now - pm.timestamp) {
+            if (pm.timestamp + DOWNLOAD_QUEUE_REQUESTS_TIMEOUT < now) {
                 System.out.println("-Xo " + pm.index + "  " + (pm.begin >> 14));
                 blockRequests.remove(i);
                 torrent.cancelBlockRequest(pm.index, pm.begin);
@@ -521,6 +554,8 @@ abstract class StdPeerConnection extends PeerConnection
 
         peer.setConnectionClosed(reason);
         torrent.onPeerDisconnect(this);
+
+        // todo: release caches via connectionFactory
     }
 
     @Override
@@ -630,9 +665,10 @@ abstract class StdPeerConnection extends PeerConnection
                 blockRequests.add(message);
             }
             else if (message.type == StdPeerMessage.PIECE) {
-                // let torrent to unlock block of data
+                // let storage to unlock block of data
                 // and return it into cache of blocks
-                torrent.releaseBlock(message);
+                TorrentStorage.Block block = (TorrentStorage.Block) message.params;
+                block.release();
                 pmCache.release(message);
             }
             else if (message.type == StdPeerMessage.CHOKE) {
@@ -763,16 +799,12 @@ abstract class StdPeerConnection extends PeerConnection
             }
         }
 
-        // todo: move logic to torrent ?
-        if (!torrent.completed && (torrent.state == Torrent.State.ACTIVE)) {
-            // add another request for this peer,
-            // could be add by #update on the next turn,
-            // but this could send request on this IO turn
-            enqueueBlockRequests();
-        }
-
         // notify torrent to read & process the data
         torrent.onPiece(this, buffer, index, begin, length);
+
+        // enqueue new request right now to be sent on this cycle,
+        // otherwise it will wait till call to #update()
+        enqueueBlockRequests();
     }
 
     /**
@@ -784,7 +816,7 @@ abstract class StdPeerConnection extends PeerConnection
     void onChoke(boolean state)
     {
         peerChoke = state;
-        if (DEBUG) System.out.println(peer.address + " onChoke: " + state);
+        //if (DEBUG) System.out.println(peer.address + " onChoke: " + state);
 
         if (peerChoke) {
             // remove all enqueued requests as they will be dropped by the remote peer
@@ -832,15 +864,14 @@ abstract class StdPeerConnection extends PeerConnection
                     && (pm.begin == begin)
                     && (pm.length == length))
             {
-                sendQueue.remove(i);
-                torrent.releaseBlock(pm);
+                peerBlockRequests.remove(i);
                 pmCache.release(pm);
                 break;
             }
         }
 
         // check if response has been enqueued,
-        // could be skipped if not found in pBR
+        // could be skipped if found in pBR
         for (int i = 0; i < sendQueue.size(); i++) {
             StdPeerMessage pm = sendQueue.get(i);
             if ((pm.type == StdPeerMessage.PIECE)
@@ -849,7 +880,11 @@ abstract class StdPeerConnection extends PeerConnection
                     && (pm.length == length))
             {
                 sendQueue.remove(i);
-                torrent.releaseBlock(pm);
+                // let storage to unlock block of data
+                // and return it into cache of blocks
+                TorrentStorage.Block block = (TorrentStorage.Block) pm.params;
+                block.release();
+
                 pmCache.release(pm);
                 break;
             }
@@ -872,7 +907,8 @@ abstract class StdPeerConnection extends PeerConnection
                 StdPeerMessage pm = sendQueue.get(i);
                 if (pm.type == StdPeerMessage.PIECE) {
                     sendQueue.remove(i);
-                    torrent.releaseBlock(pm);
+                    TorrentStorage.Block block = (TorrentStorage.Block) pm.params;
+                    block.release();
                     pmCache.release(pm);
                 }
             }
@@ -928,7 +964,7 @@ abstract class StdPeerConnection extends PeerConnection
     @Override
     public void dump(Formatter formatter)
     {
-        PeerConnectionStatistics s = statistics;
+        PeerConnectionStatistics s = rawStatistics;
 
         double drate = s.download.average(4);
         drate /= 1024*1024;
