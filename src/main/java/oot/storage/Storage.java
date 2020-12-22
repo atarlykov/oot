@@ -1,5 +1,6 @@
-package oot.poc;
+package oot.storage;
 
+import oot.Torrent;
 import oot.be.Metainfo;
 
 /**

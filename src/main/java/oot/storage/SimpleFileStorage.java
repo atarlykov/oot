@@ -1,33 +1,43 @@
-package oot;
+package oot.storage;
 
+import oot.Torrent;
 import oot.be.Metainfo;
 
-import java.io.File;
-import java.io.IOException;
+
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
+import java.nio.file.*;
+
 import java.util.ArrayDeque;
+import java.util.BitSet;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Consumer;
 
 /**
- * Storage that allows writing torrent data to dist and reading
- * it back synchronously and without any caching,
+ * Storage that allows writing torrent data to disk and reading
+ * it back synchronously and without any caching, uses common root folder
+ * for all active torrents
  *
  * that usually works fine, but blocks network operations,
  * the same time this prevent client from flooding with requests
+ *
+ * supports only one fixed block size (could be extended, needs refactoring)
+ *
+ * uses {@link java.util.concurrent.ExecutorService} to run long tasks
+ * like disk space allocations and torrent checks
  */
-public class AsyncFileStorage extends Storage {
+public class SimpleFileStorage extends Storage
+{
+    private final static boolean DEBUG = true;
 
     /**
      * simple internal container to link file information from metainfo
      * to specific file channel to read/write data
      */
-    private static class TorrentFile {
+    protected static class TorrentFile {
         FileChannel channel;
         Metainfo.FileInfo info;
     }
@@ -37,103 +47,103 @@ public class AsyncFileStorage extends Storage {
      * to perform storing and reads of data
      */
     public class SimpleFileTorrentStorage extends TorrentStorage {
-        // parent torrent
-        //Torrent torrent;
-        TorrentFile[] files;
-        long[] filesEndSizeSums;
+        /**
+         * files of a torrent, based on metadata
+         */
+        final TorrentFile[] files;
+        /**
+         * cumulative positions of files' ends inside global torrent data
+         */
+        final long[] filesEndSizeSums;
 
-
-        public SimpleFileTorrentStorage(Path _root, Metainfo _metainfo) {
-            super(_metainfo, TorrentStorageState.UNKNOWN);
-            root = _root;
+        /**
+         * allowed constructor
+         * @param _metainfo info about the torrent
+         */
+        public SimpleFileTorrentStorage(Metainfo _metainfo) {
+            super(_metainfo, TorrentStorage.State.UNKNOWN);
             files = new TorrentFile[metainfo.files.size()];
             filesEndSizeSums = new long[metainfo.files.size()];
         }
 
-
         @Override
         public void init(Consumer<Boolean> callback) {
-            AsyncFileStorage.this._init(this, preallocate, callback);
-        }
-
-        public void init(boolean _preallocate, Consumer<Boolean> callback) {
-            AsyncFileStorage.this._init(this, _preallocate, callback);
-        }
-
-
-        @Override
-        public ByteBuffer getBuffer() {
-            return AsyncFileStorage.this.getBuffer();
-        }
-
-        @Override
-        public void releaseBuffer(ByteBuffer buffer) {
-            AsyncFileStorage.this.releaseBuffer(buffer);
+            SimpleFileStorage.this._init(this, preallocate, callback);
         }
 
         @Override
         public void check(Consumer<Boolean> callback) {
-            super.check(callback);
+            // todo
         }
 
-        @Override
-        public void writeBlock(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {
-            // make copy to run save operation in parallel
 
+        @Override
+        public void write(ByteBuffer buffer, int index, int position, int length, Consumer<Block> callback)
+        {
             ByteBuffer tmp = getBuffer();
             tmp.put(buffer).flip();
 
-            //exSave.submit(() -> {
-                boolean result = _save(this, tmp, index, begin, length);
-                releaseBuffer(tmp);
-                if (callback != null) {
-                    callback.accept(result);
-                }
-            //});
+            boolean result = _save(this, tmp, index, position, length);
+            releaseBuffer(tmp);
+            if (callback != null) {
+                Block b = new Block(index, position, length);
+                b.index = index;
+                b.position = position;
+                b.length = length;
+                callback.accept(b);
+            }
         }
 
         @Override
-        public void readBlock(ByteBuffer buffer, int index, int begin, int length, Consumer<Boolean> callback) {
-            exRead.submit(() -> {
-                boolean result = _read(this, buffer, index, begin, length);
-                if (callback != null) {
-                    callback.accept(result);
-                }
-            });
+        public void read(int index, int position, int length, Object param, Consumer<Block> callback)
+        {
+            Block b = new Block(index, position, length, getBuffer());
+            boolean result = _read(this, b.buffer, index, position, length);
+            if (callback != null) {
+                callback.accept(b);
+            }
         }
 
+        @Override
+        public void release(Block block) {
+            releaseBuffer(block.buffer);
+        }
+
+        @Override
+        public void writeState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
+            SimpleFileStorage.this.writeState(metainfo, pieces, active);
+        }
+
+        @Override
+        public void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active, Consumer<Boolean> callback) {
+            SimpleFileStorage.this.readState(metainfo, pieces, active, callback);
+        }
     }
 
     /**
-     * common root folder to be used as default root path for all torrents
+     * common root folder to be used as default root path
+     * for all torrents and other data
      */
-    private Path root;
+    protected Path root;
 
     /**
-     * do we preallocate space by default
+     * do we need to preallocate space by default
      */
-    private boolean preallocate = true;
-
-    /**
-     * size of blocks (buffers) we are going to use
-     */
-    private int blockSize;
+    protected boolean preallocate = true;
 
     /**
      * cached buffers
      */
-    final ArrayDeque<ByteBuffer> cache = new ArrayDeque<>();
+    protected final ArrayDeque<ByteBuffer> cache = new ArrayDeque<>();
 
+    // debug
+    protected long buffersAllocated = 0;
 
-    ThreadPoolExecutor exRead = (ThreadPoolExecutor) Executors.newFixedThreadPool(2);
-    static ThreadPoolExecutor exSave = (ThreadPoolExecutor) Executors.newFixedThreadPool(2);
+    /**
+     * executor for long operations line pre-allocation and checking
+     */
+    ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(4);
 
-    public int getReadQueueSize() {
-        return exRead.getQueue().size();
-    }
-    public int getSaveQueueSize() {
-        return exSave.getQueue().size();
-    }
 
     /**
      * allowed constructor
@@ -141,8 +151,8 @@ public class AsyncFileStorage extends Storage {
      * @param _preallocate files will be pre-allocated if true
      * @param _blockSize size of blocks/buffers to use
      */
-    public AsyncFileStorage(Path _root, boolean _preallocate, int _blockSize) {
-        super(0);
+    public SimpleFileStorage(Path _root, boolean _preallocate, int _blockSize) {
+        super(_blockSize);
         this.root = _root;
         this.preallocate = _preallocate;
         this.blockSize = _blockSize;
@@ -150,17 +160,24 @@ public class AsyncFileStorage extends Storage {
 
     @Override
     public TorrentStorage getStorage(Metainfo metainfo) {
-        return new SimpleFileTorrentStorage(root, metainfo);
+        return new SimpleFileTorrentStorage(metainfo);
+    }
+
+    @Override
+    public void init() {
+        super.init();
     }
 
     @Override
     public void stop() {
-        exRead.shutdown();
-        exSave.shutdown();
+        executor.shutdown();
     }
 
-    static long buffersAllocated = 0;
 
+    /**
+     * allocates new or allows to reuse a buffer for io operation
+     * @return cached or new allocated buffer
+     */
     ByteBuffer getBuffer() {
         synchronized (cache) {
             ByteBuffer buffer = cache.pollFirst();
@@ -173,6 +190,10 @@ public class AsyncFileStorage extends Storage {
         }
     }
 
+    /**
+     * returns buffer to cache for reuse
+     * @param buffer buffer
+     */
     void releaseBuffer(ByteBuffer buffer) {
         synchronized (cache) {
             buffer.clear();
@@ -181,25 +202,26 @@ public class AsyncFileStorage extends Storage {
     }
 
     /**
-     * initializes torrents' storage to be used for reading/writing,
+     * initializes torrent specific storage to be used for reading/writing,
      * @param allocate do we want to pre allocate files or not
      * @param callback callback to be notified on finish
      */
-    private void _init(SimpleFileTorrentStorage ts, boolean allocate, Consumer<Boolean> callback) {
-
+    protected void _init(SimpleFileTorrentStorage ts, boolean allocate, Consumer<Boolean> callback)
+    {
         // open channels and init files' info
         try {
-            _bind(ts);
-            ts.state = TorrentStorageState.READY;
+            _bind(ts.metainfo, ts.files);
+            ts.state = TorrentStorage.State.READY;
         } catch (IOException e) {
+            if (DEBUG) System.out.println(e.getMessage());
             if (callback != null) {
                 callback.accept(false);
             }
             return;
         }
 
-        // calculate "end sums" to map pieces to files later
-        long sum = 0l;
+        // calculate "end sums" to quickly map pieces to files during io
+        long sum = 0L;
         for (int i = 0; i < ts.files.length; i++) {
             TorrentFile file = ts.files[i];
             sum += file.info.length;
@@ -207,11 +229,11 @@ public class AsyncFileStorage extends Storage {
         }
 
         if (allocate) {
-            exRead.submit(() -> {
+            executor.submit(() -> {
                 try {
-                    ts.state = TorrentStorageState.ALLOCATING;
+                    ts.state = TorrentStorage.State.ALLOCATING;
                     _allocate(ts);
-                    ts.state = TorrentStorageState.READY;
+                    ts.state = TorrentStorage.State.READY;
                     // notify
                     callback.accept(true);
                 } catch (IOException e) {
@@ -226,33 +248,51 @@ public class AsyncFileStorage extends Storage {
 
 
     /**
-     * opens channels for all files of the parent torrent
+     * creates directory structure for multi file torrents,
+     * creates files on disk for all torrent's files and
+     * bind newly created file channel to them.
+     * @param metainfo torrent metainfo
+     * @param files containers to hold binding info
      * @throws IOException if any
      */
-    private void _bind(SimpleFileTorrentStorage ts) throws IOException {
-        Metainfo metainfo = ts.metainfo;
+    protected void _bind(Metainfo metainfo, TorrentFile[] files) throws IOException
+    {
+        if (metainfo.files.size() != files.length) {
+            throw new IOException("incorrect torrent configuration (dev error)");
+        }
 
-        if (metainfo.isMultiFile()) {
+        if (metainfo.isMultiFile())
+        {
             int index = 0;
             for (Metainfo.FileInfo fileInfo: metainfo.files) {
                 TorrentFile tFile = new TorrentFile();
                 tFile.info = fileInfo;
 
-                Path path = Paths.get(metainfo.directory, (String[]) fileInfo.names.toArray());
-                Path full = root.resolve(path);
+                // check if path to file exists
+                Path path = root.resolve(metainfo.directory);
+                if (!Files.exists(path)) {
+                    Files.createDirectory(path);
+                }
+                for (int i = 0; i < fileInfo.names.size() - 1; i++) {
+                    path = path.resolve(fileInfo.names.get(i));
+                    if (!Files.exists(path)) {
+                        Files.createDirectory(path);
+                    }
+                }
+                path = path.resolve(fileInfo.names.get(fileInfo.names.size() - 1));
 
-                tFile.channel = _bind(full, fileInfo);
-                ts.files[index++] = tFile;
+                tFile.channel = _bind(path, fileInfo);
+                files[index++] = tFile;
             }
         } else {
             Metainfo.FileInfo fileInfo = metainfo.files.get(0);
-            String[] names = (String[]) fileInfo.names.toArray(String[]::new);
+            String[] names = fileInfo.names.toArray(String[]::new);
             Path path = Paths.get(root.toString(), names);
 
             TorrentFile tFile = new TorrentFile();
             tFile.info = fileInfo;
             tFile.channel = _bind(path, fileInfo);
-            ts.files[0] = tFile;
+            files[0] = tFile;
         }
     }
 
@@ -263,7 +303,8 @@ public class AsyncFileStorage extends Storage {
      * @return opens channel
      * @throws IOException if case of any error
      */
-    private FileChannel _bind(Path path, Metainfo.FileInfo fileInfo) throws IOException {
+    protected FileChannel _bind(Path path, Metainfo.FileInfo fileInfo) throws IOException
+    {
         File file = path.toFile();
 
         if (!file.exists()) {
@@ -278,14 +319,17 @@ public class AsyncFileStorage extends Storage {
                     StandardOpenOption.READ,
                     StandardOpenOption.WRITE);
 
+            // todo: better to store some storage state and check
             if (file.length() == fileInfo.length) {
                 return channel;
             }
             else if (file.length() < fileInfo.length) {
+                // todo: need to indicate error and request re-check
                 return channel;
             }
             else {
                 // that's strange, unknown file?
+                // todo: need to indicate error and request re-check
                 return channel;
             }
         }
@@ -295,7 +339,7 @@ public class AsyncFileStorage extends Storage {
      * allocates space for all files
      * @throws IOException if any
      */
-    private void _allocate(SimpleFileTorrentStorage ts) throws IOException {
+    protected void _allocate(SimpleFileTorrentStorage ts) throws IOException {
         for (int i = 0; i < ts.files.length; i++) {
             TorrentFile file = ts.files[i];
             if (file.channel.size() < file.info.length) {
@@ -315,7 +359,8 @@ public class AsyncFileStorage extends Storage {
      * @param length size of the data
      * @return true on success and false if position is incorrect or io error
      */
-    private boolean _save(SimpleFileTorrentStorage ts, ByteBuffer buffer, int index, int begin, int length) {
+    protected boolean _save(SimpleFileTorrentStorage ts, ByteBuffer buffer, int index, int begin, int length)
+    {
         // linear address of the 1st byte to write
         long la = ts.metainfo.pieceLength * index + begin;
 
@@ -370,7 +415,8 @@ public class AsyncFileStorage extends Storage {
      * @param length size of the data
      * @return true on success and false if position is incorrect or io error
      */
-    private boolean _read(SimpleFileTorrentStorage ts, ByteBuffer buffer, int index, int begin, int length) {
+    private boolean _read(SimpleFileTorrentStorage ts, ByteBuffer buffer, int index, int begin, int length)
+    {
         // linear address of the 1st byte to read
         long la = ts.metainfo.pieceLength * index + begin;
 
@@ -416,13 +462,103 @@ public class AsyncFileStorage extends Storage {
         return true;
     }
 
+    /**
+     * TODO: remove OOS
+     * @param metainfo
+     * @param pieces
+     * @param active
+     */
+    protected void writeState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active) {
+        try {
+            Path state = root.resolve("state");
+            Path path = state.resolve(metainfo.infohash.toString());
+
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            ObjectOutputStream os = new ObjectOutputStream(bos);
+            os.writeObject(pieces);
+            os.writeObject(active);
+            os.flush();
+
+            if (!Files.exists(state)) {
+                Files.createDirectory(state);
+            }
+            Files.write(path, bos.toByteArray());
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    protected void readState(Metainfo metainfo, BitSet pieces, Map<Integer, Torrent.PieceBlocks> active, Consumer<Boolean> callback) {
+        try {
+            Path path = root.resolve("state/" + metainfo.infohash.toString());
+            if (!Files.exists(path)) {
+                if (callback != null) {
+                    callback.accept(false);
+                }
+                return;
+            }
+
+            byte[] data = Files.readAllBytes(path);
+
+            ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(data));
+
+            BitSet rPieces = (BitSet) ois.readObject();
+            pieces.clear();
+            pieces.or(rPieces);
+
+            Map<Integer, Torrent.PieceBlocks> rActive = (Map<Integer, Torrent.PieceBlocks>) ois.readObject();
+            active.clear();
+            rActive.forEach((p, b) -> {
+                //b.active.clear();
+                active.put(p, b);
+                throw new RuntimeException("review & fix");
+            });
+
+            if (callback != null) {
+                callback.accept(true);
+            }
+
+        } catch (Exception e) {
+            if (callback != null) {
+                callback.accept(false);
+            }
+        }
+    }
+
     @Override
     public void write(String key, byte[] data) {
+        try {
+            Path state = root.resolve("state");
+            if (!Files.exists(state)) {
+                Files.createDirectory(state);
+            }
 
+            Path path = state.resolve(key);
+            Files.write(path, data,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.SYNC);
+
+        } catch (IOException ignored) {
+        }
     }
 
     @Override
     public byte[] read(String key) {
-        return new byte[0];
+        try {
+            Path state = root.resolve("state");
+            if (!Files.exists(state)) {
+                return null;
+            }
+
+            Path path = state.resolve(key);
+            return Files.readAllBytes(path);
+        } catch (IOException ignored) {
+        }
+        return null;
     }
+
 }

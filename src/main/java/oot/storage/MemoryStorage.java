@@ -1,5 +1,6 @@
-package oot.poc;
+package oot.storage;
 
+import oot.Torrent;
 import oot.be.Metainfo;
 
 import java.nio.ByteBuffer;
@@ -7,6 +8,11 @@ import java.util.BitSet;
 import java.util.Map;
 import java.util.function.Consumer;
 
+/**
+ * Storage that allocates byte array for each torrent (size is limited as int max).
+ * Writes and reads data synchronously inside torrents' processing threads.
+ * Could be used for testing or downloading one-file torrents.
+ */
 public class MemoryStorage extends Storage
 {
 
@@ -65,6 +71,7 @@ public class MemoryStorage extends Storage
 
         @Override
         public void release(Block block) {
+            // no blocks are locked
         }
 
         @Override
@@ -92,7 +99,8 @@ public class MemoryStorage extends Storage
 
     @Override
     public void write(String key, byte[] data) {
-
+        // no read/write is supported,
+        // could be implemented as Map<String, byte[]>
     }
 
     @Override

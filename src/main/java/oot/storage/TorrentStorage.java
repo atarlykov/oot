@@ -1,5 +1,6 @@
-package oot.poc;
+package oot.storage;
 
+import oot.Torrent;
 import oot.be.Metainfo;
 
 import java.nio.ByteBuffer;
@@ -47,23 +48,23 @@ public abstract class TorrentStorage {
         // block length
         public int length;
         // ref to buffer with data
-        public ByteBuffer data;
+        public ByteBuffer buffer;
         // optional param
         public Object param;
 
-        public Block(int index, int position, int length, ByteBuffer data, Object param) {
+        public Block(int index, int position, int length, ByteBuffer buffer, Object param) {
             this.index = index;
             this.position = position;
             this.length = length;
-            this.data = data;
+            this.buffer = buffer;
             this.param = param;
         }
 
-        public Block(int index, int position, int length, ByteBuffer data) {
+        public Block(int index, int position, int length, ByteBuffer buffer) {
             this.index = index;
             this.position = position;
             this.length = length;
-            this.data = data;
+            this.buffer = buffer;
         }
 
         public Block(int index, int position, int length) {
@@ -84,7 +85,7 @@ public abstract class TorrentStorage {
     /**
      * state of the this TorrentStorage
      */
-    State state;
+    volatile State state;
 
     /**
      * allowed constructor
