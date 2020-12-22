@@ -1,4 +1,4 @@
-package oot.poc;
+package oot;
 
 import oot.dht.HashId;
 

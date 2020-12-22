@@ -3,17 +3,20 @@ package oot;
 import oot.be.Metainfo;
 import oot.dht.HashId;
 import oot.dht.Node;
+import oot.storage.Storage;
+import oot.storage.TorrentStorage;
+import oot.tracker.DhtTrackerFactory;
+import oot.tracker.StandardTrackerFactory;
+import oot.tracker.TrackerFactory;
 
 import java.io.IOException;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
-import java.nio.charset.StandardCharsets;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
+import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 
 public class Client {
 
@@ -29,7 +32,7 @@ public class Client {
     /**
      * timeout to call {@link Torrent#update()} method for each torrent registered
      */
-    private static final long TORRENT_UPDATE_TIMEOUT = 100;
+    private static final long TORRENT_UPDATE_TIMEOUT = 1000;
     /**
      * timeout to dump state and connections of each torrent (debug)
      */
@@ -49,21 +52,9 @@ public class Client {
 
     /**
      * unique 'fixed' identifier of this client
+     * todo: public is only to compile poc
      */
-    HashId id;
-
-    // list of torrents [or map]
-    private List<Torrent> torrents;
-
-    /**
-     * service executor available for torrents,
-     * to be used for some tasks
-     */
-    ExecutorService executor = new ThreadPoolExecutor(
-            2, 16,
-            60L, TimeUnit.SECONDS,
-            new SynchronousQueue<Runnable>());
-
+    public HashId id;
 
     /**
      * the only one selector per client,
@@ -85,33 +76,6 @@ public class Client {
     private boolean dhtEnabled;
 
     /**
-     * instance of api class to work with trackers
-     */
-    TrackersManager trackersManager;
-
-    /**
-     * thread that handles client's updates
-     * in background
-     */
-    private class ClientThread extends Thread
-    {
-        // state flag to stop the thread
-        volatile boolean active = true;
-
-        @Override
-        public void run() {
-            while (active) {
-                update();
-            }
-        }
-    }
-
-    /**
-     * ref to running thread
-     */
-    private ClientThread thread;
-
-    /**
      * timestamp of the last update of speed limits
      */
     private long timeLastSpeedLimitsUpdate = 0;
@@ -128,6 +92,11 @@ public class Client {
      */
     private long speedLimitUpload;
 
+    /**
+     * list of tracker factories used to resolve tracker urls
+     * and provide tracker implementations, like http,udp,dht,pex,...
+     */
+    final List<TrackerFactory> trackerFactories = new ArrayList<>();
 
     /**
      * allowed constructor
@@ -152,8 +121,6 @@ public class Client {
         System.arraycopy(ID_VERSION_PREFIX, 0, id.getBytes(), 0, ID_VERSION_PREFIX.length);
 
         storage = _storage;
-        torrents = new ArrayList<>();
-        trackersManager = new TrackersManager(this);
 
         dhtEnabled = _dhtEnable;
         if (dhtEnabled) {
@@ -164,13 +131,11 @@ public class Client {
                 node = new Node();
             }
         }
-    }
 
-    /**
-     * @return true if DHT support is active
-     */
-    public boolean isDhtEnabled() {
-        return dhtEnabled;
+        // standard factories
+        trackerFactories.add(new DhtTrackerFactory(node));
+        //trackerFactories.add(new PexTrackerFactory(node));
+        trackerFactories.add(new StandardTrackerFactory(id));
     }
 
     /**
@@ -202,38 +167,459 @@ public class Client {
         return HashId.wrap(data);
     }
 
+
+
     /**
-     * adds another torrent to be managed by the client
-     * @param info parsed meta info of the torrent
-     * @return ref to registered torrent
+     * calculates download speed across all registered torrents in bytes/sec
+     * @param seconds number of seconds to average (if data is available)
+     * @return bytes/sec
      */
-    Torrent addTorrent(Metainfo info) {
-        Storage.TorrentStorage tStorage = storage.getStorage(info);
-        Torrent torrent = new Torrent(this, info, tStorage);
-        torrents.add(torrent);
-        return torrent;
+//    public long getDownloadSpeed(int seconds) {
+//        long total = 0;
+//        for (int i = 0; i < torrents.size(); i++) {
+//            Torrent torrent = torrents.get(i);
+//            total += torrent.getDownloadSpeed(seconds);
+//        }
+//        return total;
+//    }
+
+    /**
+     * calculates upload speed across all registered torrents in bytes/sec
+     * @param seconds number of seconds to average (if data is available)
+     * @return bytes/sec
+     */
+//    public long getUploadSpeed(int seconds) {
+//        long total = 0;
+//        for (int i = 0; i < torrents.size(); i++) {
+//            Torrent torrent = torrents.get(i);
+//            total += torrent.getUploadSpeed(seconds);
+//        }
+//        return total;
+//    }
+
+    /**
+     * sets global download limit,
+     * note: could be easily extended to support per torrent limits
+     * @param limit number of bytes/sec
+     */
+//    public void setSpeedLimitDownload(long limit)
+//    {
+//        speedLimitDownload = limit;
+//
+//        if (torrents.size() == 0) {
+//            return;
+//        }
+//
+//        if (limit == 0) {
+//            for (Torrent torrent : torrents) {
+//                torrent.setDownloadSpeedLimit(0);
+//            }
+//            return;
+//        }
+//
+//        // calculate total and per torrent bandwidths
+//        long[] speeds = new long[torrents.size()];
+//        long total = 0;
+//        for (int i = 0; i < torrents.size(); i++) {
+//            Torrent torrent = torrents.get(i);
+//            speeds[i] = torrent.getDownloadSpeed(2);
+//            total += speeds[i];
+//        }
+//
+//        long averageSpeedLimit = total / speeds.length;
+//        long availableSpeedBudget = speedLimitDownload - total;
+//
+//        int hightSpeedCount = 0;
+//        for (int i = 0; i < torrents.size(); i++) {
+//            Torrent torrent = torrents.get(i);
+//            long speed = speeds[i];
+//
+//            if (speed < averageSpeedLimit - Torrent.BLOCK_LENGTH) {
+//                // let this torrent to use more bandwidth,
+//                // soft target is the same speed for all
+//                torrent.setDownloadSpeedLimit(averageSpeedLimit);
+//            } else {
+//                hightSpeedCount++;
+//            }
+//        }
+//
+//        long averageSpeedBudget = availableSpeedBudget / hightSpeedCount;
+//        for (int i = 0; i < torrents.size(); i++) {
+//            Torrent torrent = torrents.get(i);
+//            long speed = speeds[i];
+//            if (averageSpeedLimit - Torrent.BLOCK_LENGTH <= speed) {
+//                torrent.setDownloadSpeedLimit(speed + averageSpeedBudget);
+//            }
+//        }
+//    }
+
+
+    /**
+     * collection of all the torrents tracked by the client
+     */
+    final ConcurrentHashMap<HashId, Torrent> torrents = new ConcurrentHashMap<>();
+
+    /**
+     * stored references to torrents in active state,
+     * populated on torrents' start/stop/add/...
+     * NOTE: accessed only from client thread
+     */
+    final ConcurrentHashMap<HashId, Torrent> active = new ConcurrentHashMap<>();
+    /**
+     * active torrents' runner threads
+     */
+    final List<TorrentRunnerThread> runners = new ArrayList<>();
+    /**
+     * collection of queues for each active torrent,
+     * must be cleared eventually by client's main thread
+     */
+    final ConcurrentMap<Torrent, ConcurrentLinkedQueue<TRCmd>> runCmdQueues = new ConcurrentHashMap<>();
+    /**
+     * marker queue to sequentially notify runner threads
+     * about new commands available to be processed for a torrent
+     */
+    final ConcurrentLinkedQueue<Torrent> runMarkerQueue = new ConcurrentLinkedQueue<>();
+    /**
+     * commands queue processed by client thread in {@link #update()}
+     */
+    final ConcurrentLinkedQueue<Runnable> clCmdQueue = new ConcurrentLinkedQueue<>();
+
+
+    long timeLastActiveTorrentUpdate;
+    long timeLastActiveDump;
+
+
+    /**
+     * base class for all commands, processed by torrent runners
+     * todo: could be replaced with queue<Runnable>
+     */
+    static abstract class TRCmd {
+        /**
+         * method will be executed by a torrent runner,
+         * under lock protection to access a torrent
+         */
+        abstract void execute();
     }
 
     /**
-     * access outside the client's thread must be synchronized
-     * @return ref to internal torrents collection
+     * will call peer connection io processing
      */
-    public List<Torrent> getTorrents() {
-        return torrents;
+    static class PeerConnectionCmd extends TRCmd
+    {
+        // ref to peer connection that will be processed
+        PeerConnection pc;
+
+        /**
+         * allowed constructor
+         * @param _pc ref to pc
+         */
+        public PeerConnectionCmd(PeerConnection _pc) {
+            pc = _pc;
+        }
+        @Override
+        void execute() {
+            pc.onChannelReady();
+        }
     }
 
     /**
-     * starts client processing inside the dedicated thread
+     * will call #{@link Torrent#update()}
+     */
+    static class TorrentUpdateCmd extends TRCmd
+    {
+        // ref to torrent that will be processed
+        Torrent torrent;
+
+        /**
+         * allowed constructor
+         * @param _torrent ref to torrent
+         */
+        public TorrentUpdateCmd(Torrent _torrent) {
+            torrent = _torrent;
+        }
+        @Override
+        void execute() {
+            torrent.update();
+        }
+    }
+
+    /**
+     * will call #{@link Torrent#dump()}
+     */
+    static class TorrentDumpCmd extends TRCmd
+    {
+        // ref to torrent that will be processed
+        Torrent torrent;
+
+        /**
+         * allowed constructor
+         * @param _torrent ref to torrent
+         */
+        public TorrentDumpCmd(Torrent _torrent) {
+            torrent = _torrent;
+        }
+        @Override
+        void execute() {
+            torrent.dump();
+        }
+    }
+
+    /**
+     * will call #{@link Torrent#startTorrent()} ()}
+     */
+    static class TorrentStartCmd extends TRCmd
+    {
+        // ref to torrent that will be processed
+        Torrent torrent;
+
+        /**
+         * allowed constructor
+         * @param _torrent ref to torrent
+         */
+        public TorrentStartCmd(Torrent _torrent) {
+            torrent = _torrent;
+        }
+        @Override
+        void execute() {
+            torrent.startTorrent();
+        }
+    }
+
+    /**
+     * threads used to process connections' updates for torrents
+     * and other possible commands that must be executed in bounds
+     * of a torrents' processing thread
+     */
+    class TorrentRunnerThread extends Thread
+    {
+
+        public TorrentRunnerThread() {
+            setName("oot-runner");
+        }
+
+        @Override
+        public void run()
+        {
+            while (true)
+            {
+                // get marker if exists
+                Torrent torrent = runMarkerQueue.poll();
+                if (torrent != null) {
+                    // try lock, if unsuccessful - some other runner
+                    // is processing this torrent after getting another marker,
+                    // that's ok, let him process the queue
+                    if (torrent.runnerLock.tryLock()) {
+                        // process all commands for this torrent
+                        // with lock protection
+                        try {
+                            ConcurrentLinkedQueue<TRCmd> commands = runCmdQueues.get(torrent);
+                            if (DEBUG) {
+                                //TRCmd peek = commands.peek();
+                                //System.out.println(System.nanoTime() + "  [TR] (cycle)  queue size:" + commands.size() +
+                                //        (peek != null ? "   " + peek.getClass() : ""));
+                            }
+                            TRCmd command = null;
+                            while ((command = commands.poll()) != null) {
+                                command.execute();
+                            }
+                        } finally {
+                            torrent.runnerLock.unlock();
+                        }
+                    }
+                } else {
+                    // marker queue is empty,
+                    // wait for new events
+                    synchronized (runMarkerQueue) {
+                        try {
+                            //System.out.println(System.nanoTime() + "  [TR]  (wait)");
+                            long tStart = System.nanoTime();
+                            runMarkerQueue.wait(100);
+                            long tEnd = System.nanoTime();
+                            System.out.println("[TR] time:" + (tEnd - tStart)/1000000);
+                        } catch (InterruptedException ignored) {
+                            // seems controlling client wants
+                            // to stop this instance
+                            break;
+                        }
+                    }
+                }
+
+                // separate check in case if queue is always full,
+                // but we must stop processing
+                if (Thread.interrupted()) {
+                    break;
+                }
+            }
+        }
+    }
+
+
+    /**
+     * thread that handles client's updates
+     * in background
+     */
+    protected class ClientThread extends Thread
+    {
+
+        public ClientThread() {
+            setName("oot-client");
+        }
+
+        // state flag to stop the thread
+        volatile boolean active = true;
+
+        @Override
+        public void run() {
+            while (active) {
+                update();
+            }
+            Client.this._stop();
+        }
+    }
+
+    /**
+     * ref to running thread
+     */
+    private volatile ClientThread thread;
+
+    /**
+     * main client's method, called periodically by the service
+     * thread to perform IO operation on connections and update
+     * states of al linked torrents
+     */
+    private void update()
+    {
+        // distribute connections per torrents' specific queues
+        // to be processed by torrent runners
+        try {
+
+//            if (DEBUG) {
+//                selector.keys().stream().forEach(key ->
+//                        System.out.println("[client]  (r:" + key.readyOps() + " i:" + key.interestOps() + ")" )
+//                );
+//            }
+
+            // by default use small timeout, but
+            // increase a lot in case id active
+            // todo: include seeding/speed check
+            long selectTimeout = 1;
+            if (active.isEmpty()) {
+                selectTimeout = 1000;
+            }
+
+            long tSelectStart = System.nanoTime();
+            // The problem is that while we are selecting key with (ready:x interest:0)
+            // it could be updated to (r:x i:5), but we still will be selecting till
+            // the timeout expires and only the next select will fire...
+            // [client] count:0  time:timeout  (was r:5 i:0)  (sel r:5 i:1)  <-- key modified during select
+            // [client] count:1  time:0        (was r:5 i:1)  (sel r:1 i:1)
+            // (selector impl doesn't guarantee to fire on modified keys)
+            // And it stands for any interest at the moment of select call that in is not ready during selection,
+            // so why selections must be not very seldom.
+            // Must not the case when there are many connections
+            selector.selectedKeys().clear();
+            int count = selector.select(selectTimeout);
+            long tSelectEnd = System.nanoTime();
+
+//            if (DEBUG) {
+//                selector.keys().stream().forEach(key ->
+//                        System.out.println("[client]" +
+//                                "  (r:" + key.readyOps() + " i:" + key.interestOps() + ")" +
+//                                "  time:" + (tSelectEnd - tSelectStart)/1000000 +
+//                                "  count:" + count
+//                        ));
+//            }
+
+
+            if (DEBUG && (count == 0) && (tSelectEnd - tSelectStart < 100000)) {
+                System.out.println(System.nanoTime() + "  [client] selected:0  time:" + (tSelectEnd - tSelectStart));
+            }
+
+            if (0 < count) {
+                Set<SelectionKey> keys = selector.selectedKeys();
+                keys.forEach(sKey -> {
+                    // switch of all interest for the key,
+                    // otherwise it will fire each time in this thread
+                    // till it's handled in processor thread,
+                    // interest must be set in processing
+                    sKey.interestOpsAnd(0);
+                    PeerConnection pc = (PeerConnection) sKey.attachment();
+                    // add command to process specific torrent/connection,
+                    // a number of commands is created... could be optimized
+                    sendCommandToTorrent(pc.torrent, new PeerConnectionCmd(pc));
+                });
+            }
+
+        } catch (IOException ignored) {
+            // todo
+        }
+
+        long now = System.currentTimeMillis();
+        if (timeLastActiveTorrentUpdate + TORRENT_UPDATE_TIMEOUT < now) {
+            active.forEach( (hash, torrent) -> {
+                // add another hard time limit ???
+                if (isTorrentCmdQueueEmpty(torrent)) {
+                    sendCommandToTorrent(torrent, new TorrentUpdateCmd(torrent));
+                }
+            });
+            timeLastActiveTorrentUpdate = now;
+        }
+
+
+        if (DEBUG && (timeLastActiveDump + TORRENT_DUMP_TIMEOUT < now)) {
+            active.forEach( (hash, torrent) -> sendCommandToTorrent(torrent, new TorrentDumpCmd(torrent)) );
+            timeLastActiveDump = now;
+        }
+
+
+        if (dhtEnabled && (timeLastDHTStateSave + DHT_NODE_STATE_SAVE_TIMEOUT < now))
+        {
+            // save state only of node bootstrapped
+            // otherwise it's possible to ruin the state
+            if (node.isBootstrapped())
+            {
+                timeLastDHTStateSave = now;
+                node.getState(data -> {
+                    // could be null if not bootstrapped
+                    if (data != null) {
+                        storage.write(DHT_NODE_STATE_SAVE_KEY, data);
+                    }
+                });
+            }
+        }
+
+
+        // todo: runners' management, start/interrupt
+
+
+        // process commands that must be run
+        // in bounds of the main client's thread
+        Runnable cmd = null;
+        while ((cmd = clCmdQueue.poll()) != null) {
+            try {
+                cmd.run();
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    /**
+     * starts client processing inside the dedicated thread,
+     * must be called on start and only once
      * @return true if resources were allocated successfully
      */
     public boolean start()
     {
+        if (thread != null) {
+            return true;
+        }
+/*
         try {
             trackersManager.init();
         } catch (IOException e) {
             if (DEBUG) System.out.println("client: error starting trackersManager: " + e.getMessage());
             return false;
         }
+*/
 
         try {
             selector = Selector.open();
@@ -245,7 +631,7 @@ public class Client {
 
         if (dhtEnabled) {
             try {
-                node.start();
+                node.start(true);
             } catch (IOException e) {
                 if (DEBUG) System.out.println("client: error starting DHT node: " + e.getMessage());
                 stop();
@@ -258,6 +644,9 @@ public class Client {
         thread.setDaemon(true);
         thread.start();
 
+
+        manageRunnerThreads();
+
         return true;
     }
 
@@ -267,17 +656,30 @@ public class Client {
     public void stop()
     {
         if (thread == null) {
-            // has not been started
             return;
         }
-
+        // this will stop main thread
+        // and calls _stop
+        thread.active = false;
         try {
-            thread.active = false;
             // this will give us happens-before
             // for all subsequent operations
             thread.join();
-        } catch (InterruptedException ignored) {}
+        } catch (InterruptedException ignored) {
+        }
 
+        // indicate we are stopped
+        thread = null;
+    }
+
+    /**
+     * internal method that's called on client thread's stop,
+     * performs various cleanup in bounds of the main processing thread
+     */
+    private void _stop()
+    {
+
+/*
         trackersManager.stop();
 
         if (dhtEnabled) {
@@ -286,335 +688,102 @@ public class Client {
             storage.write(DHT_NODE_STATE_SAVE_KEY, state);
             node.stop();
         }
+*/
 
-        storage.stop();
-    }
+        runners.forEach( Thread::interrupt);
+        runners.forEach( thread -> {
+            try {
+                thread.join();
+            } catch (InterruptedException ignored) {
+            }
+        });
 
-
-    /**
-     * main client's method, called periodically by the service
-     * thread to perform IO operation on connections and update
-     * states of al linked torrents
-     */
-    private void update()
-    {
         try {
-            // for all torrents
-            selector.select(sKey -> {
-                PeerConnection p = (PeerConnection) sKey.attachment();
-                p.onChannelReady();
-            }, 10);
-        } catch (IOException ignored) {
-            // todo
+            storage.stop();
+        } catch (Exception e) {
         }
+    }
 
-        long now = System.currentTimeMillis();
-        for (Torrent torrent: torrents) {
-            if (TORRENT_UPDATE_TIMEOUT < now - torrent.timeLastUpdate) {
-                torrent.update();
-            }
+    /**
+     * add command to torrent's commands' queue to be processed
+     * by a runner thread and appends a marker to marker queue
+     * to allow runner threads have fair mode
+     *
+     * @param torrent torrent to send cmd to
+     * @param cmd cmd to send
+     */
+    private void sendCommandToTorrent(Torrent torrent, TRCmd cmd)
+    {
+        runCmdQueues.computeIfAbsent(
+                torrent,
+                t -> new ConcurrentLinkedQueue<>()
+        ).add(cmd);
 
-            if (DEBUG) {
-                if (TORRENT_DUMP_TIMEOUT < now - torrent.timeLastDump) {
-                    torrent.timeLastDump = now;
-                    torrent.dump();
-                }
-            }
+        synchronized (runMarkerQueue) {
+            // add marker to process the torrent
+            runMarkerQueue.add(torrent);
+            runMarkerQueue.notify();
         }
+    }
 
-        if (SPEED_LIMITS_UPDATE_TIMEOUT < now - timeLastSpeedLimitsUpdate) {
-            setSpeedLimitDownload(speedLimitDownload);
-            timeLastSpeedLimitsUpdate = now;
+    /**
+     * @param torrent torrent to check command queue for
+     * @return if command queue for the specified torrent is missing or empty
+     */
+    private boolean isTorrentCmdQueueEmpty(Torrent torrent)
+    {
+        ConcurrentLinkedQueue<TRCmd> trCmds = runCmdQueues.get(torrent);
+        if (trCmds == null) {
+            return true;
         }
+        return trCmds.isEmpty();
+    }
 
-        if (isDhtEnabled())
+    /**
+     * adds another torrent to be managed by the client
+     * @param info parsed meta info of the torrent
+     * @return ref to registered torrent
+     */
+    public Torrent addTorrent(Metainfo info, Consumer<Boolean> cb)
+    {
+        TorrentStorage tStorage = storage.getStorage(info);
+        Torrent torrent = new Torrent(id, info, selector, tStorage, new ArrayList<>() /*, cb*/);
+        torrents.put(info.infohash, torrent);
+        startTorrent(info.infohash);
+
+        manageRunnerThreads();
+        return torrent;
+    }
+
+    /**
+     * sends "start" command to the torrent identified by the hash
+     * @param hash torrent hash
+     */
+    public void startTorrent(HashId hash)
+    {
+        Torrent torrent = torrents.get(hash);
+        if (torrent != null) {
+            active.putIfAbsent(hash, torrent);
+        }
+        sendCommandToTorrent(torrent, new TorrentStartCmd(torrent));
+    }
+
+    /**
+     * manages set of threads' runner threads,
+     * increases and decreases them as needed
+     * todo: implement
+     */
+    private void manageRunnerThreads()
+    {
+        synchronized (runners)
         {
-            if (DHT_NODE_STATE_SAVE_TIMEOUT < now - timeLastDHTStateSave)
-            {
-                timeLastDHTStateSave = now;
-
-                // save state only of node bootstrapped
-                // otherwise it's possible to ruin the state
-                node.getState(data -> {
-                    // could be null if not bootstrapped
-                    if (data != null) {
-                        storage.write(DHT_NODE_STATE_SAVE_KEY, data);
-                    }
-                });
-            }
-        }
-
-        trackersManager.update();
-    }
-
-    /**
-     * calculates download speed across all registered torrents in bytes/sec
-     * @param seconds number of seconds to average (if data is available)
-     * @return bytes/sec
-     */
-    public long getDownloadSpeed(int seconds) {
-        long total = 0;
-        for (int i = 0; i < torrents.size(); i++) {
-            Torrent torrent = torrents.get(i);
-            total += torrent.getDownloadSpeed(seconds);
-        }
-        return total;
-    }
-
-    /**
-     * calculates upload speed across all registered torrents in bytes/sec
-     * @param seconds number of seconds to average (if data is available)
-     * @return bytes/sec
-     */
-    public long getUploadSpeed(int seconds) {
-        long total = 0;
-        for (int i = 0; i < torrents.size(); i++) {
-            Torrent torrent = torrents.get(i);
-            total += torrent.getUploadSpeed(seconds);
-        }
-        return total;
-    }
-
-    /**
-     * sets global download limit,
-     * note: could be easily extended to support per torrent limits
-     * @param limit number of bytes/sec
-     */
-    public void setSpeedLimitDownload(long limit)
-    {
-        speedLimitDownload = limit;
-
-        if (torrents.size() == 0) {
-            return;
-        }
-
-        if (limit == 0) {
-            for (Torrent torrent : torrents) {
-                torrent.setDownloadSpeedLimit(0);
-            }
-            return;
-        }
-
-        // calculate total and per torrent bandwidths
-        long[] speeds = new long[torrents.size()];
-        long total = 0;
-        for (int i = 0; i < torrents.size(); i++) {
-            Torrent torrent = torrents.get(i);
-            speeds[i] = torrent.getDownloadSpeed(2);
-            total += speeds[i];
-        }
-
-        long averageSpeedLimit = total / speeds.length;
-        long availableSpeedBudget = speedLimitDownload - total;
-
-        int hightSpeedCount = 0;
-        for (int i = 0; i < torrents.size(); i++) {
-            Torrent torrent = torrents.get(i);
-            long speed = speeds[i];
-
-            if (speed < averageSpeedLimit - Torrent.BLOCK_LENGTH) {
-                // let this torrent to use more bandwidth,
-                // soft target is the same speed for all
-                torrent.setDownloadSpeedLimit(averageSpeedLimit);
-            } else {
-                hightSpeedCount++;
-            }
-        }
-
-        long averageSpeedBudget = availableSpeedBudget / hightSpeedCount;
-        for (int i = 0; i < torrents.size(); i++) {
-            Torrent torrent = torrents.get(i);
-            long speed = speeds[i];
-            if (averageSpeedLimit - Torrent.BLOCK_LENGTH <= speed) {
-                torrent.setDownloadSpeedLimit(speed + averageSpeedBudget);
+            if (runners.isEmpty() && !active.isEmpty()) {
+                TorrentRunnerThread runner = new TorrentRunnerThread();
+                runner.setDaemon(true);
+                runner.start();
+                runners.add(runner);
             }
         }
     }
-
-    /**
-     * extracts client name from hash id, supports not all the clients
-     * @param id hash id of the client to decode
-     * @return not null string name
-     */
-    public String extractClientNameFromId(HashId id)
-    {
-        if (id == null) {
-            return "unknown";
-        }
-
-        byte[] data = id.getBytes();
-        if (data[0] == 'M') {
-            StringBuilder client = new StringBuilder("mainline ");
-            int i = 1;
-            while ((data[i] == '-') || Character.isDigit(data[i])) {
-                client.append(data[i] & 0xFF);
-            }
-            return client.toString();
-        }
-
-        if ((data[0] == 'e') && (data[1] == 'x') && (data[2] == 'b') && (data[3] == 'c')) {
-            return "BitComet " + (data[4] & 0xFF) + "." + (data[5] & 0xFF);
-        }
-
-        if ((data[0] == 'X') && (data[1] == 'B') && (data[2] == 'T')) {
-            return "XBT " + (data[3] & 0xFF) + "." + (data[4] & 0xFF) + "." + (data[5] & 0xFF) + (data[6] == 'd' ? " debug" : "");
-        }
-
-        if ((data[0] == 'O') && (data[1] == 'P')) {
-            return "Opera " + (data[2] & 0xFF) + "." + (data[3] & 0xFF) + "." + (data[4] & 0xFF) + "." + (data[5] & 0xFF);
-        }
-
-        if ((data[0] == '-') && (data[1] == 'M') && (data[2] == 'L')) {
-            // -ML2.7.2-
-            return "MLdonkey " + extractClientAsciiText(data, 3);
-        }
-
-        if ((data[0] == '-') && (data[1] == 'B') && (data[2] == 'O') && (data[3] == 'W')) {
-            return "Bits on Wheels" + extractClientAsciiText(data, 4);
-        }
-
-        //if ((data[0] == 'Q')) {
-        //    return "Queen Bee (?) " + decodePeerAsciiTail(data, 1);
-        //}
-
-        if ((data[0] == '-') && (data[1] == 'F') && (data[2] == 'G')) {
-            return "FlashGet " + extractClientAsciiText(data, 3);
-        }
-
-        if (data[0] == 'A') {
-            return "ABC " + extractClientAsciiText(data, 1);
-        }
-        if (data[0] == 'O') {
-            return "Osprey Permaseed " + extractClientAsciiText(data, 1);
-        }
-        if (data[0] == 'Q') {
-            return "BTQueue or Queen Bee " + extractClientAsciiText(data, 1);
-        }
-        if (data[0] == 'R') {
-            return "Tribler " + extractClientAsciiText(data, 1);
-        }
-        if (data[0] == 'S') {
-            return "Shadow " + extractClientAsciiText(data, 1);
-        }
-        if (data[0] == 'T') {
-            return "BitTornado " + extractClientAsciiText(data, 1);
-        }
-        if (data[0] == 'U') {
-            return "UPnP NAT Bit Torrent " + extractClientAsciiText(data, 1);
-        }
-
-        if ((data[0] == '-') && (data[7] == '-')) {
-            String code = new String(data, 1, 2, StandardCharsets.UTF_8);
-            StringBuilder client = new StringBuilder();
-            String name = CLIENTS_DASH.get(code);
-            if (name != null) {
-                client.append(name);
-            } else {
-                client.append((char)data[1]).append((char)data[2]);
-            }
-            client.append(' ');
-            client.append(Character.digit(data[3] & 0xFF, 10));
-            client.append('.');
-            client.append(Character.digit(data[4] & 0xFF, 10));
-            client.append('.');
-            client.append(Character.digit(data[5] & 0xFF, 10));
-            client.append('.');
-            client.append(Character.digit(data[6] & 0xFF, 10));
-            return client.toString();
-        }
-
-        return "unknown " + extractClientAsciiText(data, 0);
-    }
-
-    /**
-     * transforms part of byte data into string using
-     * not terminated sequence of ascii letters and digits
-     * @param data byte array to extract ascii like text
-     * @param position start position in the array
-     * @return not null string
-     */
-    private String extractClientAsciiText(byte[] data, int position)
-    {
-        StringBuilder tmp = new StringBuilder();
-        while ((position < data.length)
-                && (0 < data[position])
-                && (('.' == data[position]) || ('-' == data[position]) || Character.isLetterOrDigit(data[position])))
-        {
-            tmp.append((char)data[position]);
-        }
-        return tmp.toString();
-    }
-
-    /**
-     * collection of known clients' abbreviations
-     */
-    private final static Map<String, String> CLIENTS_DASH = Map.ofEntries(
-            Map.entry("AG", "Ares"),
-            Map.entry("A~", "Ares"),
-            Map.entry("AR", "Arctic"),
-            Map.entry("AV", "Avicora"),
-            Map.entry("AX", "BitPump"),
-            Map.entry("AZ", "Azureus"),
-            Map.entry("BB", "BitBuddy"),
-            Map.entry("BC", "BitComet"),
-            Map.entry("BF", "Bitflu"),
-            Map.entry("BG", "BTG (uses Rasterbar libtorrent)"),
-            Map.entry("BR", "BitRocket"),
-            Map.entry("BS", "BTSlave"),
-            Map.entry("BX", "~Bittorrent X"),
-            Map.entry("CD", "Enhanced CTorrent"),
-            Map.entry("CT", "CTorrent"),
-            Map.entry("DE", "DelugeTorrent"),
-            Map.entry("DP", "Propagate Data Client"),
-            Map.entry("EB", "EBit"),
-            Map.entry("ES", "electric sheep"),
-            Map.entry("FT", "FoxTorrent"),
-            Map.entry("FW", "FrostWire"),
-            Map.entry("FX", "Freebox BitTorrent"),
-            Map.entry("GS", "GSTorrent"),
-            Map.entry("HL", "Halite"),
-            Map.entry("HN", "Hydranode"),
-            Map.entry("KG", "KGet"),
-            Map.entry("KT", "KTorrent"),
-            Map.entry("LH", "LH-ABC"),
-            Map.entry("LP", "Lphant"),
-            Map.entry("LT", "libtorrent"),
-            Map.entry("lt", "libTorrent"),
-            Map.entry("LW", "LimeWire"),
-            Map.entry("MO", "MonoTorrent"),
-            Map.entry("MP", "MooPolice"),
-            Map.entry("MR", "Miro"),
-            Map.entry("MT", "MoonlightTorrent"),
-            Map.entry("NX", "Net Transport"),
-            Map.entry("PD", "Pando"),
-            Map.entry("qB", "qBittorrent"),
-            Map.entry("QD", "QQDownload"),
-            Map.entry("QT", "Qt 4 Torrent example"),
-            Map.entry("RT", "Retriever"),
-            Map.entry("S~", "Shareaza alpha/beta"),
-            Map.entry("SB", "~Swiftbit"),
-            Map.entry("SS", "SwarmScope"),
-            Map.entry("ST", "SymTorrent"),
-            Map.entry("st", "sharktorrent"),
-            Map.entry("SZ", "Shareaza"),
-            Map.entry("TN", "TorrentDotNET"),
-            Map.entry("TR", "Transmission"),
-            Map.entry("TS", "Torrentstorm"),
-            Map.entry("TT", "TuoTu"),
-            Map.entry("UL", "uLeecher!"),
-            Map.entry("UT", "µTorrent"),
-            Map.entry("UW", "µTorrent Web"),
-            Map.entry("VG", "Vagaa"),
-            Map.entry("WD", "WebTorrent Desktop"),
-            Map.entry("WT", "BitLet"),
-            Map.entry("WW", "WebTorrent"),
-            Map.entry("WY", "FireTorrent"),
-            Map.entry("XL", "Xunlei"),
-            Map.entry("XT", "XanTorrent"),
-            Map.entry("XX", "Xtorrent"),
-            Map.entry("ZT", "ZipTorrent"),
-            Map.entry("BD", "BD"),
-            Map.entry("NP", "NP"),
-            Map.entry("wF", "wF"));
 
 }

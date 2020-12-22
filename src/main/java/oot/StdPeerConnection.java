@@ -1,7 +1,7 @@
-package oot.poc;
+package oot;
 
-import oot.PeerMessage;
 import oot.dht.HashId;
+import oot.storage.TorrentStorage;
 
 import java.nio.ByteBuffer;
 import java.nio.channels.Selector;
@@ -367,7 +367,7 @@ class StdPeerConnection extends PeerConnection
     int getEnqueuedBlockRequestsNumber() {
         int count = 0;
         for (StdPeerMessage pm : sendQueue) {
-            if (pm.type == PeerMessage.REQUEST) {
+            if (pm.type == StdPeerMessage.REQUEST) {
                 count++;
             }
         }

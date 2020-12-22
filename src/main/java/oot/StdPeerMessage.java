@@ -1,4 +1,4 @@
-package oot.poc;
+package oot;
 
 import java.nio.ByteBuffer;
 import java.util.BitSet;
