@@ -469,12 +469,58 @@ public class Node {
     }
 
     /**
+     * service method to move externally added operations to the main
+     * processing queue, check if node is already bootstrapped
+     * and declines all operations if not, allowing only one bootstrap
+     * operation at once
+     */
+    protected void applyExtOperations()
+    {
+        synchronized (extOperations)
+        {
+            if (extOperations.size() == 0) {
+                return;
+            }
+
+            if (!isBootstrapped())
+            {
+                // not yet bootstrapped, check if node
+                // is bootstrapping right now
+                boolean bootstrapping = false;
+                for (Operation operation: operations) {
+                    if (operation instanceof BootstrapOperation) {
+                        bootstrapping = true;
+                        break;
+                    }
+                }
+
+                if (bootstrapping) {
+                    // reject new operations if bootstrapping
+                    extOperations.clear();
+                } else {
+                    // allow only bootstrap operation if not yet
+                    for (Operation operation: extOperations) {
+                        if (operation instanceof BootstrapOperation) {
+                            addOperation(operation);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // node bootstrapped, all operations allowed
+                extOperations.forEach(this::addOperation);
+                extOperations.clear();
+            }
+        }
+    }
+
+    /**
      * incrementally updates node state, receives incoming messages
      * and processes all queries,
      * could be call externally only if node doesn't work
-     * inside it's own thread started with {@link #start()} method
+     * inside it's own thread started with {@link #start(boolean)}} method
      */
-    private void update()
+    protected void update()
     {
         // process incoming messages,
         // this will create more Operations so why
@@ -482,10 +528,7 @@ public class Node {
         receive();
 
         // add external requests for processing
-        synchronized (extOperations) {
-            extOperations.forEach(this::addOperation);
-            extOperations.clear();
-        }
+        applyExtOperations();
 
         // let all active operations proceed
         for (int i = operations.size() - 1; 0 <= i; i--) {
@@ -497,7 +540,6 @@ public class Node {
         }
 
         long now = System.currentTimeMillis();
-
         if (timeJobCleaning + NODE_JOB_CLEANING_TIMEOUT < now) {
             clean();
             timeJobCleaning = now;
