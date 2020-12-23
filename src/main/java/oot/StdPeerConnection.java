@@ -14,13 +14,14 @@ import java.util.stream.Stream;
 class StdPeerConnection extends PeerConnection
 {
     // debug switch
-    private static final boolean DEBUG = true;
+    private static final boolean DEBUG = false;
 
     /**
      * max number of active piece requests (for blocks) could be sent
      * to any external peer (it's 5 by the spec, but should be higher on good connections)
+     * todo: support dynamic max
      */
-    public static final int DOWNLOAD_QUEUED_REQUESTS_MAX = 11;
+    public static final int DOWNLOAD_QUEUED_REQUESTS_MAX = 21;
     /**
      * timeout for outgoing request to wait for answer,
      * will be dropped and resent on timeout (to the same or
@@ -28,7 +29,7 @@ class StdPeerConnection extends PeerConnection
      * NOTE: highly related to QUEUE size as pieces/blocks
      * could be received too slow
      */
-    public static final int DOWNLOAD_QUEUE_REQUESTS_TIMEOUT = 16_000;
+    public static final int DOWNLOAD_QUEUE_REQUESTS_TIMEOUT = 60_000;
     /**
      * length of time period to aggregate downloaded and uploaded bytes,
      * in milliseconds
@@ -201,7 +202,7 @@ class StdPeerConnection extends PeerConnection
     {
         if (DEBUG) {
             if (message.type == StdPeerMessage.REQUEST) {
-                System.out.println("[stdpc] enqueue: req " + message.index + "  " + (message.begin >> 14));
+                System.out.println(System.nanoTime() + "  [stdpc] enqueue: req " + message.index + "  " + (message.begin >> 14));
             } else {
                 System.out.println("[stdpc] enqueue: " + message.type);
             }
@@ -958,11 +959,21 @@ class StdPeerConnection extends PeerConnection
     }
 
     /**
+     *
+     * @return completion percent on the side of this peer
+     */
+    protected int getPeerCompletionPercent()
+    {
+        BitSet pp = getPeerPieces();
+        return (int)(pp.cardinality() * 100L / torrent.metainfo.pieces);
+    }
+
+    /**
      * dumps active connections of the torrent to stdout
      * @param formatter formatter to dump tha state
      */
     @Override
-    public void dump(Formatter formatter)
+    protected void dump(Formatter formatter)
     {
         PeerConnectionStatistics s = rawStatistics;
 
@@ -971,7 +982,7 @@ class StdPeerConnection extends PeerConnection
         double urate = s.upload.average(4);
         urate /= 1024*1024;
 
-        formatter.format("%24s %2S%2S %1c%1c %1c%1c %5.1f %3d %6d | %5.1f %2d %6d  %s\n",
+        formatter.format("%24s %2S%2S %1c%1c %1c%1c %5.1f %3d %6d | %5.1f %2d %6d %5d  %s\n",
                 peer.address,
                 connected ? "+" : "-",
                 handshaked ? "+" : "-",
@@ -981,8 +992,9 @@ class StdPeerConnection extends PeerConnection
                 peerChoke ? 'c' : '-',
                 peerInterested ? 'i' : '-',
 
-                drate, blockRequests.size(), s.blocksReceived,
-                urate, 0, s.blocksSent,
+                drate, blockRequests.size(), statistics.blocksReceived,
+                urate, 0, statistics.blocksSent,
+                getPeerCompletionPercent(),
                 StdPeerProtocol.extractClientNameFromId(peer.peerId));
     }
 }
