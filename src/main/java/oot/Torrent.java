@@ -8,7 +8,6 @@ import oot.tracker.*;
 import java.io.Serializable;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.channels.Selector;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -18,7 +17,7 @@ import java.util.function.Consumer;
 public class Torrent
 {
     // debug switch
-    private static final boolean DEBUG = true;
+    private static final boolean DEBUG = false;
 
     /**
      * lock used by runner threads to run torrents
@@ -75,7 +74,7 @@ public class Torrent
      * describes status of a piece dividing it into blocks
      * downloaded separately from (possibly) different connections
      */
-    public static class PieceBlocks implements Serializable {
+    public static class PieceBlocks implements Serializable, Cloneable {
         /**
          * time of the last update
          */
@@ -108,89 +107,19 @@ public class Torrent
             active.clear();
         }
 
-    }
-
-
-    /**
-     * must be refactored in generic/std way
-     */
-    static class StdPeerConnectionBufferCache
-    {
-        static ByteBuffer getReceiveBuffer() {
-            ByteBuffer buffer = ByteBuffer.allocateDirect(StdPeerConnectionFactory.RECV_BUFFER_SIZE);
-            buffer.order(ByteOrder.BIG_ENDIAN);
-            return buffer;
-        }
-        static ByteBuffer getSendBuffer() {
-            ByteBuffer buffer = ByteBuffer.allocateDirect(StdPeerConnectionFactory.SEND_BUFFER_SIZE);
-            buffer.order(ByteOrder.BIG_ENDIAN);
-            return buffer;
-        }
-
-        void releaseReceiveBuffer(ByteBuffer buffer) {
-        }
-        void releaseSendBuffer(ByteBuffer buffer) {
+        @Override
+        public Object clone() throws CloneNotSupportedException {
+            PieceBlocks clone = (PieceBlocks) super.clone();
+            clone.ready = (BitSet) ready.clone();
+            clone.active = (BitSet) active.clone();
+            return clone;
         }
     }
 
     /**
-     * must bu refactored to generic factory
+     * connections factory
+     * todo: refactor to generic way, upgradable, etc.
      */
-    static class StdPeerConnectionFactory {
-        /**
-         * max size of the data requested with PIECE message,
-         * affects buffers (move to upper level?)
-         */
-        public static final int PIECE_BLOCK_MAX_SIZE = 16 << 10;
-        /**
-         * number of byte in PIECE message prefix (before data)
-         * 4b length, 1b type, 2*4b params
-         */
-        public static final int MSG_PIECE_PREFIX_LENGTH = 13;
-
-        /**
-         * size of the receive buffer, it MUST be more than
-         * size of the max allowed PIECE message plus some
-         * operational space for small messages..
-         * but seems it's best to size it to allow receive several
-         * small messages and one PIECE inside first part (normal mode).
-         * that could work well when pieces are mixed with small messages
-         */
-        public static final int RECV_BUFFER_SIZE = 256 + 2 * PIECE_BLOCK_MAX_SIZE;
-        public static final int SEND_BUFFER_SIZE = 256 + 2 * PIECE_BLOCK_MAX_SIZE;
-
-        /**
-         * max allowed space of the receive buffer to be used in normal mode,
-         * tail space must allow writing of max (PIECE - 1)
-         */
-        public static final int RECV_BUFFER_NORMAL_LIMIT = RECV_BUFFER_SIZE - PIECE_BLOCK_MAX_SIZE - MSG_PIECE_PREFIX_LENGTH;
-        public static final int SEND_BUFFER_NORMAL_LIMIT = SEND_BUFFER_SIZE - PIECE_BLOCK_MAX_SIZE - MSG_PIECE_PREFIX_LENGTH;
-
-        /**
-         * amount of data in buffer to allow it's compaction (copy data to the beginning),
-         * mostly to copy small parts of data
-         */
-        public static final int SEND_BUFFER_COMPACT_LIMIT = 128; // could be == MSG_PIECE_PREFIX_LENGTH;
-
-        StdPeerMessageCache pmCache = new StdPeerMessageCache();
-
-        StdPeerConnection openConnection(Selector _selector, Torrent _torrent, Peer _peer)
-        {
-            ByteBuffer recvBuffer = StdPeerConnectionBufferCache.getReceiveBuffer();
-            ByteBuffer sendBuffer = StdPeerConnectionBufferCache.getSendBuffer();
-            return new StdPeerConnection(_selector, _torrent, _peer,
-                    recvBuffer, RECV_BUFFER_NORMAL_LIMIT, 128,
-                    sendBuffer, SEND_BUFFER_NORMAL_LIMIT, SEND_BUFFER_COMPACT_LIMIT,
-                    pmCache);
-        }
-
-        void closeConnection(PeerConnection pc) {
-            if (pc instanceof StdPeerConnection) {
-                // release buffers
-            }
-        }
-    }
-
     StdPeerConnectionFactory pcFactory = new StdPeerConnectionFactory();
 
 
@@ -326,12 +255,12 @@ public class Torrent
     /**
      * per-torrent storage api
      */
-    private TorrentStorage storage;
+    TorrentStorage storage;
 
     /**
      * global state of this torrent
      */
-    private Torrent.State state;
+    Torrent.State state;
 
     /**
      * do we have all the data of this torrent or not,
@@ -349,7 +278,7 @@ public class Torrent
     /**
      * list of associated trackers to announce
      */
-    List<Tracker> trackers;
+    List<Tracker> trackers = new ArrayList<>();
 
     /**
      * download speed limit of this torrent, in bytes/sec
@@ -370,13 +299,6 @@ public class Torrent
     private Selector selector;
 
     /**
-     * cache of PeerMessage instances...
-     * they are short lived objects and could be handled by GC,
-     * but this work well too
-     */
-    //PeerMessageCache pmCache = new PeerMessageCache();
-
-    /**
      * service queue with parameters of blocks written to storage,
      * used to separate main processing thread and callback running in a storage thread
      */
@@ -390,17 +312,17 @@ public class Torrent
 
     /**
      * service queue to run commands/callback inside the processing thread,
-     * commands are executed by {@link #update()}
-     * NOTE: could include read/write queues
+     * commands are triggered by {@link #update()} call from a thread runner class,
+     * mostly should be used for commands without strong latency requirements
      */
-    private final ArrayDeque<Runnable> commands = new ArrayDeque<>(256);
+    private final ArrayDeque<TorrentCommand> commands = new ArrayDeque<>(256);
 
     /**
      * allowed constructor
      * @param _clientId client id that handles torrents
      * @param _metainfo meta info of the torrent
      */
-    private Torrent(HashId _clientId, Metainfo _metainfo, Selector _selector, List<Tracker> _trackers)
+    private Torrent(HashId _clientId, Metainfo _metainfo, Selector _selector)
     {
         clientId = _clientId;
         metainfo = _metainfo;
@@ -408,7 +330,6 @@ public class Torrent
 
         pieceBlocks = (int)(metainfo.pieceLength >> BLOCK_LENGTH_BITS);
         pieces = new BitSet((int)metainfo.pieces);
-        trackers = _trackers;
 
         state = Torrent.State.UNKNOWN;
     }
@@ -419,8 +340,8 @@ public class Torrent
      * @param _metainfo meta info of the torrent
      * @param _storage storage to be used to read/write torrent data
      */
-    public Torrent(HashId _client, Metainfo _metainfo, Selector _selector, TorrentStorage _storage, List<Tracker> _trackers) {
-        this(_client, _metainfo, _selector, _trackers);
+    public Torrent(HashId _client, Metainfo _metainfo, Selector _selector, TorrentStorage _storage) {
+        this(_client, _metainfo, _selector);
         storage = _storage;
     }
 
@@ -725,7 +646,7 @@ public class Torrent
      * @return number of blocks allocated and requested via the specified connection,
      * zero if there are no more blocks could be requested via the connection
      */
-    private int enqueueBlocks(PeerConnection pc, BitSet pPieces, int blocks)
+    protected int enqueueBlocks(PeerConnection pc, BitSet pPieces, int blocks)
     {
         int allocated = 0;
         for (Map.Entry<Integer, Torrent.PieceBlocks> entry: piecesActive.entrySet())
@@ -783,7 +704,7 @@ public class Torrent
      * @return number of blocks allocated and requested via the specified connection,
      * zero if there are no more blocks of the specified piece could be requested via the connection
      */
-    private int enqueueBlocksInsidePiece(PeerConnection pc, int piece, Torrent.PieceBlocks pb, int amount)
+    protected int enqueueBlocksInsidePiece(PeerConnection pc, int piece, Torrent.PieceBlocks pb, int amount)
     {
         BitSet ready = pb.ready;
         BitSet active = pb.active;
@@ -822,7 +743,7 @@ public class Torrent
      * @return index of the piece allocated or -1 if no more new pieces available,
      * that means last pieces are being downloaded already or the peer has no more pieces
      */
-    private int enqueuePiece(BitSet pPieces)
+    protected int enqueuePiece(BitSet pPieces)
     {
         int index = -1;
 
@@ -853,7 +774,7 @@ public class Torrent
     /**
      * performs logic linked to all connections..
      */
-    private void updateConnections()
+    protected void updateConnections()
     {
         long now = System.currentTimeMillis();
 
@@ -895,7 +816,7 @@ public class Torrent
      * closes extra connections choosing ones with the slowest upload rate
      * @param allowed number of connections to leave be
      */
-    private void closeConnections(int allowed)
+    protected void closeConnections(int allowed)
     {
         // force close seed-seed connections (must be closed already),
         // [could check interested/peerInterested flags]
@@ -934,7 +855,7 @@ public class Torrent
      * and tries to open connection to it,
      * on success registers new connection in {@link Torrent#connections}
      */
-    private void openConnection()
+    protected void openConnection()
     {
         for (Peer peer : peers) {
             if (connections.containsKey(peer)) {
@@ -997,7 +918,7 @@ public class Torrent
      * moves all new peer from peersSyncAdd collection to the main one,
      * should be called on state update
      */
-    private void moveNewPeersToMainCollection() {
+    protected void moveNewPeersToMainCollection() {
         synchronized (peersSyncAdd) {
             peers.addAll(peersSyncAdd);
             peersSyncAdd.clear();
@@ -1016,11 +937,11 @@ public class Torrent
      * called when last
      * piece of torrent has been downloaded
      */
-    void onFinished()
+    protected void onFinished()
     {
         completed = true;
         timeTorrentCompleted = System.currentTimeMillis();
-        saveState();
+        writeState();
 
         // this could be used to read state?
         finished = true;
@@ -1043,9 +964,9 @@ public class Torrent
      * @param begin block position inside the piece
      * @param length length of the block, must be == buffer.remaining()
      */
-    void onPiece(PeerConnection pc, ByteBuffer buffer, int index, int begin, int length)
+    protected void onPiece(PeerConnection pc, ByteBuffer buffer, int index, int begin, int length)
     {
-        if (DEBUG) System.out.println("onPiece: " + index + "  " + (begin >> 14));
+        if (DEBUG) System.out.println(System.nanoTime() + "  [onPiece] " + index + "  " + (begin >> 14));
         storage.write(buffer, index, begin, length, (block) -> {
             if (block == null) {
                 // todo: new instance of lambda is possible here, --> make inner class ?
@@ -1064,7 +985,7 @@ public class Torrent
      * called by the main processing thread to mark
      * saved blocks (stored on a separate queue) as downloaded
      */
-    private void onPieceProcessWrittenBlocks()
+    protected void onPieceProcessWrittenBlocks()
     {
         synchronized (written) {
             TorrentStorage.Block block;
@@ -1084,7 +1005,7 @@ public class Torrent
      * @param begin block position inside the piece
      * @param length length of the block, must be == buffer.remaining()
      */
-    void onRequest(PeerConnection pc, int index, int begin, int length)
+    protected void onRequest(PeerConnection pc, int index, int begin, int length)
     {
         storage.read(index, begin, length, pc, block -> {
             synchronized (read) {
@@ -1097,7 +1018,7 @@ public class Torrent
      * called by the main processing thread to enqueue
      * loaded blocks (stored on a separate queue) to the connection
      */
-    private void onRequestProcessReadBlocks()
+    protected void onRequestProcessReadBlocks()
     {
         synchronized (read) {
             TorrentStorage.Block block;
@@ -1114,9 +1035,10 @@ public class Torrent
      * called from a connection to notify that physical connection is closed
      * @param pc peer connection
      */
-    void onPeerDisconnect(PeerConnection pc) {
-        // peer will be removed in update()
-        //System.out.println(pc.peer.address + " error / disconnected");
+    protected void onPeerDisconnect(PeerConnection pc) {
+        // peer will be removed from connections list in updateConnections()
+        // but release resources now
+        pcFactory.closeConnection(pc);
     }
 
     /**
@@ -1124,7 +1046,7 @@ public class Torrent
      * @param _pieces state of all pieces
      * @param _active state of the pieces being downloaded
      */
-    private void getCompletionState(BitSet _pieces, Map<Integer, BitSet> _active)
+    protected void getCompletionState(BitSet _pieces, Map<Integer, BitSet> _active)
     {
         _pieces.clear();
         _pieces.or(pieces);
@@ -1238,7 +1160,7 @@ public class Torrent
         Formatter formatter = new Formatter();
         formatter.format("torrent: %s\n", metainfo.infohash.toString());
         formatter.format("                              L  P                                 \n");
-        formatter.format("                          C H CI CI   DLR  RQ   BLKS |   UPL  Q   BLKS\n");
+        formatter.format("                          C H CI CI   DLR  RQ   BLKS |   UPL  Q   BLKS     %%\n");
 
         connections.values().forEach(pc -> pc.dump(formatter));
 
@@ -1257,7 +1179,7 @@ public class Torrent
      * open/close new connections, send keep alive messages,
      * perform some maintenance, etc.
      */
-    void update()
+    protected void update()
     {
 
         System.out.println(" *** [ TUPDATE ] *** ");
@@ -1270,7 +1192,7 @@ public class Torrent
             updateConnections();
 
             // try to get more peers, methods must check timeout
-            trackers.forEach(t -> t.updateIfReady( (success, ps) -> {
+            trackers.forEach(tracker -> tracker.updateIfReady( (success, ps) -> {
                 if (success) {
                     addPeersFromAddresses(ps);
                 }
@@ -1279,7 +1201,7 @@ public class Torrent
             // todo re-announce?
 
             if (!completed && (TORRENT_STATE_SAVE_TIMEOUT < timeLastUpdate - timeLastStateSave)) {
-                saveState();
+                writeState();
                 timeLastStateSave = timeLastUpdate;
             }
         }
@@ -1318,30 +1240,85 @@ public class Torrent
         moveNewPeersToMainCollection();
     }
 
-    private void processCommandQueue()
+    /**
+     * initiates save store via the associated storage api,
+     * must be called only from a runner thread or via cmd
+     */
+    protected void writeState()
+    {
+        BitSet piecesClone = (BitSet) pieces.clone();
+        Map<Integer, Torrent.PieceBlocks> piecesActiveClone = new HashMap<>(piecesActive);
+        storage.writeState(piecesClone, piecesActiveClone);
+    }
+
+    /**
+     * restores state loading it from the storage
+     * @param callback callback to be notified with true if state was successfully restored and
+     *                 false if it's missing or there were some errors
+     */
+    protected void readState(Consumer<Boolean> callback)
+    {
+        BitSet piecesClone = new BitSet(pieces.size());
+        Map<Integer, Torrent.PieceBlocks> piecesActiveClone = new HashMap<>();
+
+        storage.readState(piecesClone, piecesActiveClone, result -> {
+            // this could be called on storage thread
+            addCommand(() -> {
+                // this is called in runner thread
+                if (result) {
+                    pieces.clear();
+                    pieces.or(piecesClone);
+                    piecesActive.clear();
+                    piecesActive.putAll(piecesActiveClone);
+
+                    completed = pieces.cardinality() == metainfo.pieces;
+                    finished = completed;
+                }
+                callback.accept(result);
+            });
+        });
+    }
+
+    /**
+     * processes commands that must be called
+     * in torrent's runner thread
+     */
+    protected void processCommandQueue()
     {
         synchronized (commands) {
-            Runnable fun;
+            TorrentCommand fun;
             while ((fun = commands.poll()) != null) {
-                fun.run();
+                fun.execute();
             }
         }
     }
 
-    private void addCommand(Runnable fun) {
+    /**
+     * adds command to be executed in torrent's
+     * runner thread, commands will be executed within {@link #update()} method,
+     *
+     * could be called directly but mostly supposed to be used via {@link TorrentCommands}
+     * @param fun function to run
+     */
+    public void addCommand(TorrentCommand fun) {
         synchronized (commands) {
             commands.offer(fun);
         }
     }
 
-    void startTorrent()
+    /**
+     * executes "starts" command received by this torrent,
+     * must be called only from a runner thread via sending
+     * command to this torrent via public api
+     */
+    protected void cmdStart()
     {
         State _state = state;
 
         if (_state == State.UNKNOWN)
         {
             state = State.INITIALIZING;
-            restoreState(result -> {
+            readState(result -> {
                 if (result) {
                     if (completed) {
                         state = State.SEEDING;
@@ -1371,31 +1348,5 @@ public class Torrent
         }
     }
 
-    /**
-     * initiates save store via the associated storage api
-     */
-    private void saveState() {
-        storage.writeState(pieces, piecesActive);
-    }
-
-    /**
-     * restores state loading it from the storage
-     * @param callback callback to be notified with true if state was successfully restored and
-     *                 false if it's missing or there were some errors
-     */
-    private void restoreState(Consumer<Boolean> callback)
-    {
-        storage.readState(pieces, piecesActive, result -> {
-            // this could be called on storage thread
-            addCommand(() -> {
-                // this is called in runner thread
-                if (result) {
-                    completed = pieces.cardinality() == metainfo.pieces;
-                    finished = completed;
-                }
-                callback.accept(result);
-            });
-        });
-    }
 
 }
