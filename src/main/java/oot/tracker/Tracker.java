@@ -1,7 +1,7 @@
 package oot.tracker;
 
 import oot.dht.HashId;
-import oot.poc.Torrent;
+import oot.Torrent;
 
 import java.net.InetSocketAddress;
 import java.util.Set;
@@ -98,7 +98,7 @@ public abstract class Tracker {
     }
 
     boolean isReadyToUpdate() {
-        return System.currentTimeMillis() < updateLastTime + updatePeriod;
+        return updateLastTime + updatePeriod < System.currentTimeMillis();
     }
 
     /**
@@ -106,7 +106,7 @@ public abstract class Tracker {
      * @param event type of announce
      * @param cb callback
      */
-    public abstract void announce(AnnounceEvent event, AnnounceCallback cb);
+    protected abstract void announce(AnnounceEvent event, AnnounceCallback cb);
 
     /**
      * api wrapper around generic announce implementation
@@ -125,7 +125,7 @@ public abstract class Tracker {
     public void updateIfReady(AnnounceCallback cb)
     {
         if (isReadyToUpdate()) {
-            announce(AnnounceEvent.NONE, cb);
+            update(cb);
         }
     }
 

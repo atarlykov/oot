@@ -1,13 +1,15 @@
 package oot.tracker;
 
 import oot.dht.HashId;
-import oot.poc.Torrent;
+import oot.Torrent;
 
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.function.Consumer;
 
 /**
  * factory for standard trackers (https and udp)
@@ -48,6 +50,11 @@ public class StandardTrackerFactory extends TrackerFactory
         httpProcessor = new HttpTrackerProcessor();
     }
 
+    @Override
+    public void setPeersCallback(Consumer<Collection<InetSocketAddress>> callback) {
+        udpProcessor.setPeersCallback(callback);
+        httpProcessor.setPeersCallback(callback);
+    }
 
     @Override
     public List<Tracker> create(Torrent torrent)

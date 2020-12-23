@@ -1,7 +1,7 @@
 package oot.tracker;
 
 import oot.dht.Node;
-import oot.poc.Torrent;
+import oot.Torrent;
 
 /**
  * wrapper to provide DHT peers to a torrent

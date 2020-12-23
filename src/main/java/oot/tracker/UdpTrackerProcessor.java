@@ -1,6 +1,5 @@
 package oot.tracker;
 
-import oot.Client;
 import oot.dht.HashId;
 
 import java.io.IOException;
@@ -8,12 +7,7 @@ import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.DatagramChannel;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.*;
 import java.util.function.Consumer;
 
 public class UdpTrackerProcessor {
@@ -426,6 +420,12 @@ public class UdpTrackerProcessor {
     protected final Thread thread;
 
     /**
+     * ref to callback to be notified with peers discovered,
+     * could be registered dynamically
+     */
+    protected volatile Consumer<Collection<InetSocketAddress>> peersCallback;
+
+    /**
      * allowed constructor
      * @param _clientId id of the client
      */
@@ -438,6 +438,15 @@ public class UdpTrackerProcessor {
     }
 
     /**
+     * registers callback to be called when peers are discovered
+     * via processed trackers
+     * @param cb callback
+     */
+    public void setPeersCallback(Consumer<Collection<InetSocketAddress>> cb) {
+        peersCallback =  cb;
+    }
+
+    /**
      * main api method to submit announce requests from torrent
      * @param event announce event
      * @param cb callback to be notified
@@ -445,7 +454,19 @@ public class UdpTrackerProcessor {
     public void process(UdpTracker tracker, Tracker.AnnounceEvent event, Tracker.AnnounceCallback cb)
     {
         synchronized (newOperations) {
-            newOperations.add( new UDPAnnounceOperation(tracker, event, cb));
+            newOperations.add( new UDPAnnounceOperation(tracker, event, ((success, peers) -> {
+                Consumer<Collection<InetSocketAddress>> extCallback = this.peersCallback;
+                // notify external callback if registered
+                if (extCallback != null) {
+                    extCallback.accept(peers);
+                }
+                if (cb != null) {
+                    cb.call(success, peers);
+                }
+            })));
+
+
+            newOperations.notify();
         }
     }
 
@@ -539,13 +560,34 @@ public class UdpTrackerProcessor {
     {
         while (true)
         {
+            synchronized (newOperations)
+            {
+                // copy new operations to main queue
+                operations.addAll(newOperations);
+                newOperations.clear();
+
+                if (operations.size() == 0) {
+                    try {
+                        // no active operations, wait
+                        newOperations.wait(100);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+
+                    // proceed even if don't have operations,
+                    // thi will read from the channel
+                }
+            }
+
             boolean error = !update();
 
+            // check state another time
             if (Thread.interrupted()) {
-                stop();
                 break;
             }
         }
+
+        stop();
     }
 
     /**
@@ -555,12 +597,6 @@ public class UdpTrackerProcessor {
      */
     protected boolean update()
     {
-        // apply new operations
-        synchronized (newOperations) {
-            operations.addAll(newOperations);
-            newOperations.clear();
-        }
-
         long now = System.currentTimeMillis();
         SocketAddress address;
         buffer.clear();

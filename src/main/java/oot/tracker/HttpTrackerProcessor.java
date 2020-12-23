@@ -3,16 +3,14 @@ package oot.tracker;
 import oot.be.BEParser;
 import oot.be.BEValue;
 import oot.dht.HashId;
-import oot.poc.Torrent;
+import oot.Torrent;
 
 import java.io.IOException;
 import java.net.*;
 import java.nio.ByteBuffer;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Consumer;
 
 /**
  * Utility class to process requests to http trackers,
@@ -27,6 +25,21 @@ public class HttpTrackerProcessor {
 
 
     /**
+     * ref to callback to be notified with peers discovered,
+     * could be registered dynamically
+     */
+    protected volatile Consumer<Collection<InetSocketAddress>> peersCallback;
+
+    /**
+     * registers callback to be called when peers are discovered
+     * via processed trackers
+     * @param cb callback
+     */
+    public void setPeersCallback(Consumer<Collection<InetSocketAddress>> cb) {
+        peersCallback =  cb;
+    }
+
+    /**
      * announce torrent to the specific tracker
      * @param tracker tracker (has ref to parent torrent)
      * @param event event
@@ -38,7 +51,16 @@ public class HttpTrackerProcessor {
         CompletableFuture.supplyAsync(
                 () -> httpAnnounce(query), executor)
                 .thenApply(HttpTrackerProcessor::httpAnnounceParseResponse)
-                .thenAccept(peers ->  cb.call(true, peers) );
+                .thenAccept(peers -> {
+                    Consumer<Collection<InetSocketAddress>> extCallback = this.peersCallback;
+                    // notify external callback if registered
+                    if ((extCallback != null) && !peers.isEmpty()) {
+                        extCallback.accept(peers);
+                    }
+                    if (cb != null) {
+                        cb.call(true, peers);
+                    }
+                });
     }
 
     /**
@@ -111,7 +133,6 @@ public class HttpTrackerProcessor {
     private static Optional<BEValue> httpAnnounce(String query)
     {
         try {
-            System.out.println(query);
             URL url = new URL(query);
 
             URLConnection urlConnection = url.openConnection();
