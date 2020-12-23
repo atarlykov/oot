@@ -7,9 +7,11 @@ import oot.storage.Storage;
 import oot.storage.TorrentStorage;
 import oot.tracker.DhtTrackerFactory;
 import oot.tracker.StandardTrackerFactory;
+import oot.tracker.Tracker;
 import oot.tracker.TrackerFactory;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.security.NoSuchAlgorithmException;
@@ -36,7 +38,7 @@ public class Client {
     /**
      * timeout to dump state and connections of each torrent (debug)
      */
-    private static final long TORRENT_DUMP_TIMEOUT = 10_000;
+    private static final long TORRENT_DUMP_TIMEOUT = 4_000;
     /**
      * timeout to recalculate speed limits for all torrents and connections
      */
@@ -133,16 +135,21 @@ public class Client {
         }
 
         // standard factories
-        trackerFactories.add(new DhtTrackerFactory(node));
-        //trackerFactories.add(new PexTrackerFactory(node));
-        trackerFactories.add(new StandardTrackerFactory(id));
-    }
+        DhtTrackerFactory dhtTrackerFactory = new DhtTrackerFactory(node);
+        StandardTrackerFactory standardTrackerFactory = new StandardTrackerFactory(id);
+        standardTrackerFactory.setPeersCallback(peers -> {
+            if (node.isBootstrapped()) {
+                standardTrackerFactory.setPeersCallback(null);
+            }
+            else {
+                List<InetSocketAddress> tmp = new ArrayList<>(peers);
+                node.bootstrap(tmp, null);
+            }
+        });
 
-    /**
-     * @return ref to DHT node
-     */
-    public Node getDhtNode() {
-        return node;
+        trackerFactories.add(dhtTrackerFactory);
+        //trackerFactories.add(new PexTrackerFactory(node));
+        trackerFactories.add(standardTrackerFactory);
     }
 
     /**
@@ -273,7 +280,7 @@ public class Client {
      * collection of queues for each active torrent,
      * must be cleared eventually by client's main thread
      */
-    final ConcurrentMap<Torrent, ConcurrentLinkedQueue<TRCmd>> runCmdQueues = new ConcurrentHashMap<>();
+    final ConcurrentMap<Torrent, ConcurrentLinkedQueue<TorrentCommand>> runCmdQueues = new ConcurrentHashMap<>();
     /**
      * marker queue to sequentially notify runner threads
      * about new commands available to be processed for a torrent
@@ -287,171 +294,6 @@ public class Client {
 
     long timeLastActiveTorrentUpdate;
     long timeLastActiveDump;
-
-
-    /**
-     * base class for all commands, processed by torrent runners
-     * todo: could be replaced with queue<Runnable>
-     */
-    static abstract class TRCmd {
-        /**
-         * method will be executed by a torrent runner,
-         * under lock protection to access a torrent
-         */
-        abstract void execute();
-    }
-
-    /**
-     * will call peer connection io processing
-     */
-    static class PeerConnectionCmd extends TRCmd
-    {
-        // ref to peer connection that will be processed
-        PeerConnection pc;
-
-        /**
-         * allowed constructor
-         * @param _pc ref to pc
-         */
-        public PeerConnectionCmd(PeerConnection _pc) {
-            pc = _pc;
-        }
-        @Override
-        void execute() {
-            pc.onChannelReady();
-        }
-    }
-
-    /**
-     * will call #{@link Torrent#update()}
-     */
-    static class TorrentUpdateCmd extends TRCmd
-    {
-        // ref to torrent that will be processed
-        Torrent torrent;
-
-        /**
-         * allowed constructor
-         * @param _torrent ref to torrent
-         */
-        public TorrentUpdateCmd(Torrent _torrent) {
-            torrent = _torrent;
-        }
-        @Override
-        void execute() {
-            torrent.update();
-        }
-    }
-
-    /**
-     * will call #{@link Torrent#dump()}
-     */
-    static class TorrentDumpCmd extends TRCmd
-    {
-        // ref to torrent that will be processed
-        Torrent torrent;
-
-        /**
-         * allowed constructor
-         * @param _torrent ref to torrent
-         */
-        public TorrentDumpCmd(Torrent _torrent) {
-            torrent = _torrent;
-        }
-        @Override
-        void execute() {
-            torrent.dump();
-        }
-    }
-
-    /**
-     * will call #{@link Torrent#startTorrent()} ()}
-     */
-    static class TorrentStartCmd extends TRCmd
-    {
-        // ref to torrent that will be processed
-        Torrent torrent;
-
-        /**
-         * allowed constructor
-         * @param _torrent ref to torrent
-         */
-        public TorrentStartCmd(Torrent _torrent) {
-            torrent = _torrent;
-        }
-        @Override
-        void execute() {
-            torrent.startTorrent();
-        }
-    }
-
-    /**
-     * threads used to process connections' updates for torrents
-     * and other possible commands that must be executed in bounds
-     * of a torrents' processing thread
-     */
-    class TorrentRunnerThread extends Thread
-    {
-
-        public TorrentRunnerThread() {
-            setName("oot-runner");
-        }
-
-        @Override
-        public void run()
-        {
-            while (true)
-            {
-                // get marker if exists
-                Torrent torrent = runMarkerQueue.poll();
-                if (torrent != null) {
-                    // try lock, if unsuccessful - some other runner
-                    // is processing this torrent after getting another marker,
-                    // that's ok, let him process the queue
-                    if (torrent.runnerLock.tryLock()) {
-                        // process all commands for this torrent
-                        // with lock protection
-                        try {
-                            ConcurrentLinkedQueue<TRCmd> commands = runCmdQueues.get(torrent);
-                            if (DEBUG) {
-                                //TRCmd peek = commands.peek();
-                                //System.out.println(System.nanoTime() + "  [TR] (cycle)  queue size:" + commands.size() +
-                                //        (peek != null ? "   " + peek.getClass() : ""));
-                            }
-                            TRCmd command = null;
-                            while ((command = commands.poll()) != null) {
-                                command.execute();
-                            }
-                        } finally {
-                            torrent.runnerLock.unlock();
-                        }
-                    }
-                } else {
-                    // marker queue is empty,
-                    // wait for new events
-                    synchronized (runMarkerQueue) {
-                        try {
-                            //System.out.println(System.nanoTime() + "  [TR]  (wait)");
-                            long tStart = System.nanoTime();
-                            runMarkerQueue.wait(100);
-                            long tEnd = System.nanoTime();
-                            System.out.println("[TR] time:" + (tEnd - tStart)/1000000);
-                        } catch (InterruptedException ignored) {
-                            // seems controlling client wants
-                            // to stop this instance
-                            break;
-                        }
-                    }
-                }
-
-                // separate check in case if queue is always full,
-                // but we must stop processing
-                if (Thread.interrupted()) {
-                    break;
-                }
-            }
-        }
-    }
 
 
     /**
@@ -500,7 +342,7 @@ public class Client {
 //            }
 
             // by default use small timeout, but
-            // increase a lot in case id active
+            // increase a lot in case if active
             // todo: include seeding/speed check
             long selectTimeout = 1;
             if (active.isEmpty()) {
@@ -519,6 +361,8 @@ public class Client {
             // Must not the case when there are many connections
             selector.selectedKeys().clear();
             int count = selector.select(selectTimeout);
+            // could switch to this in case in some cases
+            //int count = selector.selectNow();
             long tSelectEnd = System.nanoTime();
 
 //            if (DEBUG) {
@@ -532,7 +376,7 @@ public class Client {
 
 
             if (DEBUG && (count == 0) && (tSelectEnd - tSelectStart < 100000)) {
-                System.out.println(System.nanoTime() + "  [client] selected:0  time:" + (tSelectEnd - tSelectStart));
+                //System.out.println(System.nanoTime() + "  [client] selected:0  time:" + (tSelectEnd - tSelectStart));
             }
 
             if (0 < count) {
@@ -546,7 +390,7 @@ public class Client {
                     PeerConnection pc = (PeerConnection) sKey.attachment();
                     // add command to process specific torrent/connection,
                     // a number of commands is created... could be optimized
-                    sendCommandToTorrent(pc.torrent, new PeerConnectionCmd(pc));
+                    sendCommandToTorrent(pc.torrent, new TorrentCommands.CmdPeerConnection(pc));
                 });
             }
 
@@ -559,7 +403,7 @@ public class Client {
             active.forEach( (hash, torrent) -> {
                 // add another hard time limit ???
                 if (isTorrentCmdQueueEmpty(torrent)) {
-                    sendCommandToTorrent(torrent, new TorrentUpdateCmd(torrent));
+                    sendCommandToTorrent(torrent, new TorrentCommands.CmdTorrentUpdate(torrent));
                 }
             });
             timeLastActiveTorrentUpdate = now;
@@ -567,7 +411,7 @@ public class Client {
 
 
         if (DEBUG && (timeLastActiveDump + TORRENT_DUMP_TIMEOUT < now)) {
-            active.forEach( (hash, torrent) -> sendCommandToTorrent(torrent, new TorrentDumpCmd(torrent)) );
+            active.forEach( (hash, torrent) -> sendCommandToTorrent(torrent, new TorrentCommands.CmdTorrentDump(torrent)) );
             timeLastActiveDump = now;
         }
 
@@ -712,7 +556,7 @@ public class Client {
      * @param torrent torrent to send cmd to
      * @param cmd cmd to send
      */
-    private void sendCommandToTorrent(Torrent torrent, TRCmd cmd)
+    private void sendCommandToTorrent(Torrent torrent, TorrentCommand cmd)
     {
         runCmdQueues.computeIfAbsent(
                 torrent,
@@ -732,7 +576,7 @@ public class Client {
      */
     private boolean isTorrentCmdQueueEmpty(Torrent torrent)
     {
-        ConcurrentLinkedQueue<TRCmd> trCmds = runCmdQueues.get(torrent);
+        ConcurrentLinkedQueue<TorrentCommand> trCmds = runCmdQueues.get(torrent);
         if (trCmds == null) {
             return true;
         }
@@ -744,28 +588,50 @@ public class Client {
      * @param info parsed meta info of the torrent
      * @return ref to registered torrent
      */
-    public Torrent addTorrent(Metainfo info, Consumer<Boolean> cb)
+    public Torrent addTorrent(Metainfo info /*, Consumer<Boolean> cb*/)
     {
         TorrentStorage tStorage = storage.getStorage(info);
-        Torrent torrent = new Torrent(id, info, selector, tStorage, new ArrayList<>() /*, cb*/);
+
+        Torrent torrent = new Torrent(id, info, selector, tStorage);
+        // set trackers
+        trackerFactories.forEach(factory -> {
+            List<Tracker> trackers = factory.create(torrent);
+            torrent.trackers.addAll(trackers);
+        });
+
+        // register torrent
         torrents.put(info.infohash, torrent);
         startTorrent(info.infohash);
 
+        // check if we hae enough threads to handle torrents
         manageRunnerThreads();
         return torrent;
     }
 
     /**
-     * sends "start" command to the torrent identified by the hash
+     * could also be send via torrent ref,
+     * torrent could be used ia it's public api, mostly to send commands to it
+     * directly or via #TorrentCommands class
+     * @param hash torrent hash
+     * @return returns known torrent identified by the hash or null
+     */
+    public Torrent getTorrent(HashId hash)
+    {
+        return torrents.get(hash);
+    }
+
+    /**
+     * sends "start" command to the torrent identified by the hash,
+     * could also be send via torrent ref
      * @param hash torrent hash
      */
     public void startTorrent(HashId hash)
     {
         Torrent torrent = torrents.get(hash);
         if (torrent != null) {
-            active.putIfAbsent(hash, torrent);
+            active.putIfAbsent(torrent.metainfo.infohash, torrent);
+            TorrentCommands.cmdTorrentStart(torrent);
         }
-        sendCommandToTorrent(torrent, new TorrentStartCmd(torrent));
     }
 
     /**
@@ -778,7 +644,7 @@ public class Client {
         synchronized (runners)
         {
             if (runners.isEmpty() && !active.isEmpty()) {
-                TorrentRunnerThread runner = new TorrentRunnerThread();
+                TorrentRunnerThread runner = new TorrentRunnerThread(runMarkerQueue, runCmdQueues);
                 runner.setDaemon(true);
                 runner.start();
                 runners.add(runner);
