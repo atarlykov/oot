@@ -129,6 +129,11 @@ public abstract class PeerConnection
      */
     long speedLimitUpload;
 
+    /**
+     * indicates if this connection is initiated by our side
+     * or it's an external accepted connection
+     */
+    final boolean outgoing;
 
     /**
      * allowed constructor
