@@ -402,6 +402,9 @@ public class Client {
                     SocketChannel accepted = server.accept();
                     SelectionKey key = accepted.register(selector, SelectionKey.OP_WRITE | SelectionKey.OP_READ);
                     acceptedConnections.add(key);
+
+                    // this must be wrapped with outgoing connection,
+                    // and stored separately till handshake is finished
                 }
 
                 keys.forEach(sKey -> {
