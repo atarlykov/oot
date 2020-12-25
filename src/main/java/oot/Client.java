@@ -12,8 +12,11 @@ import oot.tracker.TrackerFactory;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.*;
@@ -63,6 +66,16 @@ public class Client {
      * is used to operate p2p connections of all torrents
      */
     Selector selector;
+    /**
+     * server socket to accept incoming connections,
+     * controlled by the client thread
+     */
+    ServerSocketChannel server;
+    /**
+     * selection key to accept connections
+     */
+    SelectionKey serverSeletionKey;
+
     /**
      * ref to storage api that is used for all
      * torrents' read/wrie operations, states save, etc.
@@ -379,8 +392,18 @@ public class Client {
                 //System.out.println(System.nanoTime() + "  [client] selected:0  time:" + (tSelectEnd - tSelectStart));
             }
 
+            Set<SelectionKey> acceptedConnections;
+
             if (0 < count) {
                 Set<SelectionKey> keys = selector.selectedKeys();
+
+                if (keys.remove(serverSeletionKey)) {
+
+                    SocketChannel accepted = server.accept();
+                    SelectionKey key = accepted.register(selector, SelectionKey.OP_WRITE | SelectionKey.OP_READ);
+                    acceptedConnections.add(key);
+                }
+
                 keys.forEach(sKey -> {
                     // switch of all interest for the key,
                     // otherwise it will fire each time in this thread
@@ -466,7 +489,14 @@ public class Client {
 */
 
         try {
+            // selector for active connections
             selector = Selector.open();
+            // server for incoming connections
+            server = ServerSocketChannel.open();
+            server.configureBlocking(false);
+            // todo move to settings/config
+            server.bind(new InetSocketAddress(40004));
+            serverSeletionKey = server.register(selector, SelectionKey.OP_ACCEPT);
         } catch (IOException e) {
             if (DEBUG) System.out.println("client: error opening selector: " + e.getMessage());
             stop();
