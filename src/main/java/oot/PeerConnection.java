@@ -131,7 +131,8 @@ public abstract class PeerConnection
 
     /**
      * indicates if this connection is initiated by our side
-     * or it's an external accepted connection
+     * or it's an external accepted connection,
+     * mostly used during the connection phase
      */
     final boolean outgoing;
 
