@@ -12,7 +12,6 @@ import oot.tracker.TrackerFactory;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.net.SocketAddress;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
@@ -21,7 +20,6 @@ import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.function.Consumer;
 
 public class Client {
 
@@ -160,7 +158,9 @@ public class Client {
             }
         });
 
-        trackerFactories.add(dhtTrackerFactory);
+        if (dhtEnabled) {
+            trackerFactories.add(dhtTrackerFactory);
+        }
         //trackerFactories.add(new PexTrackerFactory(node));
         trackerFactories.add(standardTrackerFactory);
     }
@@ -278,13 +278,12 @@ public class Client {
      * collection of all the torrents tracked by the client
      */
     final ConcurrentHashMap<HashId, Torrent> torrents = new ConcurrentHashMap<>();
-
     /**
-     * stored references to torrents in active state,
-     * populated on torrents' start/stop/add/...
-     * NOTE: accessed only from client thread
+     * stored hashes for torrents in active state,
+     * just possible optimization
      */
-    final ConcurrentHashMap<HashId, Torrent> active = new ConcurrentHashMap<>();
+    final ConcurrentHashMap<HashId, HashId> active = new ConcurrentHashMap<>();
+
     /**
      * active torrents' runner threads
      */
@@ -336,6 +335,12 @@ public class Client {
      * ref to running thread
      */
     private volatile ClientThread thread;
+
+
+    StdPeerConnectionFactory pcFactory;
+    Set<SelectionKey> acceptedConnections = new HashSet<>();
+
+
 
     /**
      * main client's method, called periodically by the service
@@ -392,31 +397,56 @@ public class Client {
                 //System.out.println(System.nanoTime() + "  [client] selected:0  time:" + (tSelectEnd - tSelectStart));
             }
 
-            Set<SelectionKey> acceptedConnections;
 
             if (0 < count) {
                 Set<SelectionKey> keys = selector.selectedKeys();
 
-                if (keys.remove(serverSeletionKey)) {
 
+                if (keys.remove(serverSeletionKey))
+                {
                     SocketChannel accepted = server.accept();
-                    SelectionKey key = accepted.register(selector, SelectionKey.OP_WRITE | SelectionKey.OP_READ);
+                    System.out.println("accepted: " + accepted.getRemoteAddress().toString());
+                    Peer peer = new Peer((InetSocketAddress) accepted.getRemoteAddress());
+                    SelectionKey key = pcFactory.acceptConnection(accepted, peer);
                     acceptedConnections.add(key);
-
-                    // this must be wrapped with outgoing connection,
-                    // and stored separately till handshake is finished
                 }
 
+
                 keys.forEach(sKey -> {
-                    // switch of all interest for the key,
-                    // otherwise it will fire each time in this thread
-                    // till it's handled in processor thread,
-                    // interest must be set in processing
-                    sKey.interestOpsAnd(0);
-                    PeerConnection pc = (PeerConnection) sKey.attachment();
-                    // add command to process specific torrent/connection,
-                    // a number of commands is created... could be optimized
-                    sendCommandToTorrent(pc.torrent, new TorrentCommands.CmdPeerConnection(pc));
+
+                    if (acceptedConnections.contains(sKey)) {
+                        StdHandshakePeerConnection pc = (StdHandshakePeerConnection) sKey.attachment();
+                        if (!pc.handshaked) {
+                            pc.onChannelReady();
+                        }
+                        if (pc.handshaked) {
+                            // remove from client's support
+                            acceptedConnections.remove(sKey);
+
+                            Torrent torrent = pc.torrent;
+                            if (torrent == null) {
+                                // must be closed already
+                                pc.close(Peer.CloseReason.NORMAL);
+                            } else {
+                                torrent.api.addConnection(pc);
+                                //active.putIfAbsent(torrent.getTorrentId(), torrent);
+                                // send marker to update the torrent
+                                sendCommandToTorrent(torrent, new TorrentCommands.CmdTorrentUpdate(torrent));
+                                System.out.println(" *** [ accepted TUPDATE ] *** ");
+                            }
+                        }
+
+                    } else {
+                        // switch of all interest for the key,
+                        // otherwise it will fire each time in this thread
+                        // till it's handled in processor thread,
+                        // interest must be set in processing
+                        sKey.interestOpsAnd(0);
+                        PeerConnection pc = (PeerConnection) sKey.attachment();
+                        // add command to process specific torrent/connection,
+                        // a number of commands is created... could be optimized
+                        sendCommandToTorrent(pc.torrent, new TorrentCommands.CmdPeerConnection(pc));
+                    }
                 });
             }
 
@@ -426,10 +456,11 @@ public class Client {
 
         long now = System.currentTimeMillis();
         if (timeLastActiveTorrentUpdate + TORRENT_UPDATE_TIMEOUT < now) {
-            active.forEach( (hash, torrent) -> {
+            torrents.forEach( (hash, torrent) -> {
                 // add another hard time limit ???
                 if (isTorrentCmdQueueEmpty(torrent)) {
                     sendCommandToTorrent(torrent, new TorrentCommands.CmdTorrentUpdate(torrent));
+                    System.out.println(" *** [ periodic TUPDATE ] *** ");
                 }
             });
             timeLastActiveTorrentUpdate = now;
@@ -437,7 +468,7 @@ public class Client {
 
 
         if (DEBUG && (timeLastActiveDump + TORRENT_DUMP_TIMEOUT < now)) {
-            active.forEach( (hash, torrent) -> sendCommandToTorrent(torrent, new TorrentCommands.CmdTorrentDump(torrent)) );
+            torrents.forEach( (hash, torrent) -> torrent.api.dump() );
             timeLastActiveDump = now;
         }
 
@@ -473,6 +504,20 @@ public class Client {
     }
 
     /**
+     * notified by all registered torrents, tracks active torrents
+     * @param torrent torrent that state was updated
+     * @param state new state
+     */
+    protected void torrentStateChanged(Torrent torrent, Torrent.State state)
+    {
+        if (state == Torrent.State.ACTIVE) {
+            active.putIfAbsent(torrent.metainfo.infohash, torrent.metainfo.infohash);
+        } else {
+            active.remove(torrent.metainfo.infohash);
+        }
+    }
+
+    /**
      * starts client processing inside the dedicated thread,
      * must be called on start and only once
      * @return true if resources were allocated successfully
@@ -500,6 +545,10 @@ public class Client {
             // todo move to settings/config
             server.bind(new InetSocketAddress(40004));
             serverSeletionKey = server.register(selector, SelectionKey.OP_ACCEPT);
+
+            // this will be called from client thread only,
+            // as client processed accepted connections
+            pcFactory = new StdPeerConnectionFactory(selector, torrents::get );
         } catch (IOException e) {
             if (DEBUG) System.out.println("client: error opening selector: " + e.getMessage());
             stop();
@@ -621,49 +670,36 @@ public class Client {
      * @param info parsed meta info of the torrent
      * @return ref to registered torrent
      */
-    public Torrent addTorrent(Metainfo info /*, Consumer<Boolean> cb*/)
+    public Torrent.Api addTorrent(Metainfo info /*, Consumer<Boolean> cb*/)
     {
         TorrentStorage tStorage = storage.getStorage(info);
+        Torrent torrent = new Torrent(this, info, pcFactory, tStorage);
 
-        Torrent torrent = new Torrent(id, info, selector, tStorage);
-        // set trackers
         trackerFactories.forEach(factory -> {
             List<Tracker> trackers = factory.create(torrent);
             torrent.trackers.addAll(trackers);
         });
 
-        // register torrent
+        // register torrent inside the client
         torrents.put(info.infohash, torrent);
-        startTorrent(info.infohash);
 
-        // check if we hae enough threads to handle torrents
+        // check if we have enough threads to handle all torrents
         manageRunnerThreads();
-        return torrent;
+
+        return torrent.api;
     }
 
     /**
-     * could also be send via torrent ref,
-     * torrent could be used ia it's public api, mostly to send commands to it
-     * directly or via #TorrentCommands class
      * @param hash torrent hash
-     * @return returns known torrent identified by the hash or null
+     * @return returns api to the torrent identified by the hash or null
      */
-    public Torrent getTorrent(HashId hash)
-    {
-        return torrents.get(hash);
-    }
-
-    /**
-     * sends "start" command to the torrent identified by the hash,
-     * could also be send via torrent ref
-     * @param hash torrent hash
-     */
-    public void startTorrent(HashId hash)
+    public Torrent.Api getTorrent(HashId hash)
     {
         Torrent torrent = torrents.get(hash);
         if (torrent != null) {
-            active.putIfAbsent(torrent.metainfo.infohash, torrent);
-            TorrentCommands.cmdTorrentStart(torrent);
+            return torrent.api;
+        } else {
+            return null;
         }
     }
 
@@ -676,7 +712,7 @@ public class Client {
     {
         synchronized (runners)
         {
-            if (runners.isEmpty() && !active.isEmpty()) {
+            if (runners.isEmpty() && !torrents.isEmpty()) {
                 TorrentRunnerThread runner = new TorrentRunnerThread(runMarkerQueue, runCmdQueues);
                 runner.setDaemon(true);
                 runner.start();

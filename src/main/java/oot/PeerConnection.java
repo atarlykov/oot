@@ -1,5 +1,7 @@
 package oot;
 
+import oot.dht.HashId;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
@@ -12,7 +14,7 @@ import java.util.Formatter;
  *
  * todo: check for peer.xxx usages hare, move to upper level
  *
- *
+ * Base class for all connections made to and from external peers
  */
 public abstract class PeerConnection
 {
@@ -104,9 +106,6 @@ public abstract class PeerConnection
      */
     public long timeConnected;
 
-    // parent torrent we are downloading/uploading pieces for
-    final Torrent torrent;
-
     /**
      * various per connection statistics
      */
@@ -137,8 +136,45 @@ public abstract class PeerConnection
     final boolean outgoing;
 
     /**
-     * allowed constructor
+     * ref to parent torrent we are downloading/uploading pieces for,
+     * ref could be temporary not defined for incoming connections
+     * as torrent is unknown till handshake,
+     */
+    protected Torrent torrent;
+
+
+    /**
+     * creates connection that will be handles as outgoing
+     */
+    public PeerConnection(
+            Selector _selector, Peer _peer, Torrent _torrent,
+            ByteBuffer _receiveBuffer, int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
+            ByteBuffer _sendBuffer, int _sendBufferNormalLimit, int _sendBufferCompactionLimit)
+    {
+        this(true, _selector, null, _peer, _torrent,
+                _receiveBuffer, _receiveBufferNormalLimit, _receiveBufferCompactionLimit,
+                _sendBuffer, _sendBufferNormalLimit, _sendBufferCompactionLimit);
+    }
+
+
+    /**
+     * creates connection that will be handles as accepted from an external peer
+     */
+    public PeerConnection(
+            Selector _selector, SocketChannel _channel, Peer _peer,
+            ByteBuffer _receiveBuffer, int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
+            ByteBuffer _sendBuffer, int _sendBufferNormalLimit, int _sendBufferCompactionLimit)
+    {
+        this(false, _selector, _channel, _peer, null,
+                _receiveBuffer, _receiveBufferNormalLimit, _receiveBufferCompactionLimit,
+                _sendBuffer, _sendBufferNormalLimit, _sendBufferCompactionLimit);
+    }
+
+    /**
+     * generic constructor
+     * @param _outgoing
      * @param _selector
+     * @param _channel
      * @param _peer
      * @param _receiveBuffer
      * @param _receiveBufferNormalLimit
@@ -147,17 +183,17 @@ public abstract class PeerConnection
      * @param _sendBufferNormalLimit
      * @param _sendBufferCompactionLimit
      */
-    public PeerConnection(
-            Selector _selector,
-            Torrent _torrent, Peer _peer,
-            ByteBuffer _receiveBuffer,
-            int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
-            ByteBuffer _sendBuffer,
-            int _sendBufferNormalLimit, int _sendBufferCompactionLimit)
+    protected PeerConnection(
+            boolean _outgoing,
+            Selector _selector, SocketChannel _channel, Peer _peer, Torrent _torrent,
+            ByteBuffer _receiveBuffer, int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
+            ByteBuffer _sendBuffer, int _sendBufferNormalLimit, int _sendBufferCompactionLimit)
     {
+        outgoing = _outgoing;
         selector = _selector;
-        torrent = _torrent;
+        channel = _channel;
         peer = _peer;
+        torrent = _torrent;
 
         recvBuffer = _receiveBuffer;
         receiveBufferNormalLimit = _receiveBufferNormalLimit;
@@ -171,6 +207,9 @@ public abstract class PeerConnection
 
         // reset state to start negotiation
         reset();
+
+        // consider accepted connections as connected
+        connected = !outgoing;
     }
 
 
@@ -263,6 +302,19 @@ public abstract class PeerConnection
         speedLimitUpload = 0;
     }
 
+    /**
+     * configured channel and registers it via selector,
+     * attaches this instance to the key
+     * must be called after accepted connection is created
+     * @return selection key
+     */
+    SelectionKey accept() throws IOException
+    {
+        channel.configureBlocking(false);
+        sKey = channel.register(selector, SelectionKey.OP_WRITE | SelectionKey.OP_READ);
+        sKey.attach(this);
+        return sKey;
+    }
 
     /**
      * called once after connection has been established
@@ -615,6 +667,7 @@ public abstract class PeerConnection
             //if (DEBUG) System.out.println(System.nanoTime() + "   [channel ready] (enter)  ready:" + sKey.readyOps());
 
             if (sKey.isReadable()) {
+                //System.out.println(">>>>>>>>> CHANNEL READY >>>>>>  RECEIVE  >>>>>>>>       ");
                 boolean hasIncompleteMessage;
                 do {
                     hasIncompleteMessage = receive();
@@ -627,7 +680,13 @@ public abstract class PeerConnection
                 return;
             }
 
+            // get possible data, that must be call not only for writable keys,
+            // but always to allow register WRITE interest in key,
+            // that is a solution to periodic/seldom Torrent.update() calls
+            torrent.onConnectionReadyToSend(this);
+            
             if (sKey.isWritable()) {
+                //System.out.println(">>>>>>>>> CHANNEL READY >>>>>>  SEND     >>>>>>>>");
                 // we were interested in data, send it
                 // this will register write interest in there is any data
                 send();
@@ -650,6 +709,7 @@ public abstract class PeerConnection
             e.printStackTrace();
             close(Peer.CloseReason.PROTOCOL_ERROR);
         }
+        //System.out.println("--------- CHANNEL READY ------  EXIT     --------");
     }
 
 }

@@ -2,8 +2,13 @@ package oot;
 
 import oot.dht.HashId;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Map;
@@ -100,7 +105,7 @@ public class StdPeerProtocol {
      * @param buffer buffer with data, position at the beginning of handshake
      * @return true on success parsing and false on possible errors (buffer will be in an unknown state)
      */
-    static boolean processHandshake(StdPeerConnection pc, ByteBuffer buffer)
+    static boolean processHandshake(StdHandshakePeerConnection pc, ByteBuffer buffer)
     {
         // message length must be fixed
         byte len =  buffer.get();
@@ -123,7 +128,7 @@ public class StdPeerProtocol {
         buffer.get(id);
 
         if (DEBUG) System.out.println("RCVD: handshake");
-        pc.onHandshake(reserved, HashId.wrap(hash), HashId.wrap(id));
+        pc.onHandshake(HashId.wrap(hash), HashId.wrap(id), reserved);
 
         return true;
     }
@@ -482,23 +487,27 @@ public class StdPeerProtocol {
         return true;
     }
 
+
     /**
      * populates buffer with PIECE message
      * @param buffer buffer to populate, remaining part MUST HAVE enough space
      * @param pm message to serialize into the buffer
      * @return true on success and false otherwise (impossible space checks, unknown types)
      */
-    private static boolean populatePiece(ByteBuffer buffer, StdPeerMessage pm) {
+    private static boolean populatePiece(ByteBuffer buffer, StdPeerMessage pm)
+    {
+
+        if (DEBUG) System.out.println("SEND:   type: piece    " + pm.index + " " + pm.begin + " " + pm.length + "    " + pm.block.remaining());
 
         if (buffer.remaining() < 13 + pm.block.remaining()) {
             return false;
         }
+
         buffer.putInt(9 + pm.block.remaining());
         buffer.put(pm.type);
         buffer.putInt(pm.index);
         buffer.putInt(pm.begin);
         buffer.put(pm.block);
-        if (DEBUG) System.out.println("SEND:   type: piece    " + pm.index + " " + pm.begin + " " + pm.length);
         return true;
     }
 

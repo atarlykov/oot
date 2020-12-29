@@ -15,6 +15,7 @@ import java.util.BitSet;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -47,7 +48,7 @@ public class AsyncFileStorage extends Storage {
 
 
         public SimpleFileTorrentStorage(Path _root, Metainfo _metainfo) {
-            super(_metainfo, TorrentStorage.State.UNKNOWN);
+            super(_metainfo);
             root = _root;
             files = new TorrentFile[metainfo.files.size()];
             filesEndSizeSums = new long[metainfo.files.size()];
@@ -55,8 +56,8 @@ public class AsyncFileStorage extends Storage {
 
 
         @Override
-        public void init(Consumer<Boolean> callback) {
-            AsyncFileStorage.this._init(this, preallocate, callback);
+        public void bind(boolean newTorrent, boolean allocate, boolean recheck, BiConsumer<State, BitSet> callback) {
+            AsyncFileStorage.this._init(this, preallocate, null /*callback*/);
         }
 
         @Override
@@ -102,10 +103,13 @@ public class AsyncFileStorage extends Storage {
 
         }
 
-
+        @Override
+        public void check(Consumer<BitSet> callback) {
+            
+        }
 
         @Override
-        public void check(Consumer<Boolean> callback) {
+        public void check(int piece, Consumer<Boolean> callback) {
 
         }
     }
@@ -196,7 +200,7 @@ public class AsyncFileStorage extends Storage {
         // open channels and init files' info
         try {
             _bind(ts);
-            ts.state = TorrentStorage.State.READY;
+            ts.state = TorrentStorage.State.BOUND;
         } catch (IOException e) {
             if (callback != null) {
                 callback.accept(false);
@@ -215,9 +219,9 @@ public class AsyncFileStorage extends Storage {
         if (allocate) {
             exRead.submit(() -> {
                 try {
-                    ts.state = TorrentStorage.State.ALLOCATING;
+                    ts.state = TorrentStorage.State.ALLOCATE;
                     _allocate(ts);
-                    ts.state = TorrentStorage.State.READY;
+                    ts.state = TorrentStorage.State.BOUND;
                     // notify
                     callback.accept(true);
                 } catch (IOException e) {
