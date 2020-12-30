@@ -10,6 +10,7 @@ package oot;
 public interface TorrentCommand {
     /**
      * main method
+     * @param torrent ref to torrent against which command is called
      */
-    void execute();
+    void execute(Torrent torrent);
 }

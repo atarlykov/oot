@@ -1,20 +1,20 @@
 package oot;
 
-import oot.dht.HashId;
 import oot.storage.TorrentStorage;
 
 import java.nio.ByteBuffer;
 import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Formatter;
 import java.util.List;
 import java.util.stream.Stream;
 
-class StdPeerConnection extends PeerConnection
+class StdPeerConnection extends StdHandshakePeerConnection
 {
     // debug switch
-    private static final boolean DEBUG = false;
+    private static final boolean DEBUG = true;
 
     /**
      * max number of active piece requests (for blocks) could be sent
@@ -108,11 +108,11 @@ class StdPeerConnection extends PeerConnection
      * has been received or not, need it to switch
      * to "normal" messages processing
      */
-    public boolean handshaked = false;
+    //public boolean handshaked = false;
     /**
      * timestamp of the handshake event
      */
-    long timeHandshaked;
+    //long timeHandshaked;
 
     /**
      * tracks if bitfield has been received or not
@@ -168,26 +168,45 @@ class StdPeerConnection extends PeerConnection
 
     /**
      * ref to instance of messages' cache,
-     * could be removed what inline classes are available
+     * could be removed when inline classes are available
      */
     StdPeerMessageCache pmCache;
 
+    /**
+     * outgoing connection
+     */
     public StdPeerConnection(
-            Selector _selector,
-            Torrent _torrent, Peer _peer,
-            ByteBuffer _receiveBuffer,
-            int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
-            ByteBuffer _sendBuffer,
-            int _sendBufferNormalLimit, int _sendBufferCompactionLimit,
-            StdPeerMessageCache _pmCache)
+            Selector _selector, Torrent _torrent, Peer _peer,
+            ByteBuffer _receiveBuffer, int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
+            ByteBuffer _sendBuffer, int _sendBufferNormalLimit, int _sendBufferCompactionLimit,
+            StdPeerMessageCache _pmCache,
+            TorrentProvider _torrentProvider)
     {
         super(_selector, _torrent, _peer,
                 _receiveBuffer, _receiveBufferNormalLimit, _receiveBufferCompactionLimit,
-                _sendBuffer, _sendBufferNormalLimit, _sendBufferCompactionLimit);
-
+                _sendBuffer, _sendBufferNormalLimit, _sendBufferCompactionLimit,
+                _torrentProvider);
         pmCache = _pmCache;
     }
 
+    /**
+     * accepted connection
+     */
+    public StdPeerConnection(
+            Selector _selector, SocketChannel _channel, Peer _peer,
+
+            ByteBuffer _receiveBuffer, int _receiveBufferNormalLimit, int _receiveBufferCompactionLimit,
+            ByteBuffer _sendBuffer, int _sendBufferNormalLimit, int _sendBufferCompactionLimit,
+            StdPeerMessageCache _pmCache,
+            TorrentProvider _torrentProvider)
+    {
+        super(_selector, _channel, _peer,
+                _receiveBuffer, _receiveBufferNormalLimit, _receiveBufferCompactionLimit,
+                _sendBuffer, _sendBufferNormalLimit, _sendBufferCompactionLimit,
+                _torrentProvider);
+
+        pmCache = _pmCache;
+    }
 
     /**
      * adds another message to the send queue for sending when channel is ready,
@@ -200,13 +219,13 @@ class StdPeerConnection extends PeerConnection
      */
     protected void enqueue(StdPeerMessage message)
     {
-        if (DEBUG) {
-            if (message.type == StdPeerMessage.REQUEST) {
-                System.out.println(System.nanoTime() + "  [stdpc] enqueue: req " + message.index + "  " + (message.begin >> 14));
-            } else {
-                System.out.println("[stdpc] enqueue: " + message.type);
-            }
-        }
+//        if (DEBUG) {
+//            if (message.type == StdPeerMessage.REQUEST) {
+//                System.out.println(System.nanoTime() + "  [stdpc] enqueue: req " + message.index + "  " + (message.begin >> 14));
+//            } else {
+//                System.out.println("[stdpc] enqueue: " + message.type);
+//            }
+//        }
 
         if (message.type == StdPeerMessage.CHOKE)
         {
@@ -261,12 +280,15 @@ class StdPeerConnection extends PeerConnection
             // enqueue message
             sendQueue.add(message);
         }
+
+//        sendQueue.forEach(pm -> System.out.println("    -x> " + System.identityHashCode(pm) + pm.type + "  ,"  + pm.index +"," + pm.begin +"," + pm.length) );
+
     }
 
 
     @Override
     protected boolean hasEnqueuedDate() {
-        return !sendQueue.isEmpty();
+        return super.hasEnqueuedDate() || !sendQueue.isEmpty();
     }
 
     @Override
@@ -337,11 +359,11 @@ class StdPeerConnection extends PeerConnection
                 return;
             }
 
-            if (!peerInterested) {
-                // other side not interested in us too, disconnect
-                close(Peer.CloseReason.NORMAL);
-                return;
-            }
+//            if (!peerInterested) {
+//                // other side not interested in us too, disconnect
+//                close(Peer.CloseReason.NORMAL);
+//                return;
+//            }
 
             if (interested) {
                 // sent we are not interested in peer
@@ -417,6 +439,15 @@ class StdPeerConnection extends PeerConnection
     @Override
     void enqueuePiece(ByteBuffer buffer, int index, int position, int length, Object params)
     {
+//        if (DEBUG) System.out.println("[stdpc] enqueuePiece:" + index + "," + position + "," + length + "     buf:" + buffer.remaining());
+//        sendQueue.forEach(pm ->
+//                System.out.println("    -s> " + System.identityHashCode(pm) + "     " +pm.type + "  ,"  + pm.index +"," + pm.begin + "," + pm.length)
+//        );
+//        peerBlockRequests.forEach(pm -> {
+//            System.out.println("    -p> " + pm.type + "  ,"  + pm.index +"," + pm.begin + "," + pm.length);
+//        });
+
+
         boolean found = false;
 
         // check for the active linked peer request and remove it
@@ -426,15 +457,16 @@ class StdPeerConnection extends PeerConnection
                     && (pm.begin == position)
                     && (pm.length == length))
             {
-                blockRequests.remove(i);
+                peerBlockRequests.remove(i);
                 pmCache.release(pm);
                 found = true;
                 break;
             }
         }
         if (!found && DEBUG) {
-            System.out.println("torrent.enqueuePiece: pBR not found (cancelled?): " + index + " " + position + " " + length);
+            if (DEBUG) System.out.println("[stdpc] pBR not found");
         }
+
         enqueue(pmCache.piece(index, position, length, buffer, params));
     }
 
@@ -521,7 +553,12 @@ class StdPeerConnection extends PeerConnection
 
         // send our handshake directly as it doesn't fit into peer message
         // and there is always space in send buffer on new connection
-        enqueue(pmCache.handshake(torrent.getTorrentId(), torrent.getClientId()));
+        //enqueue(pmCache.handshake(torrent.getTorrentId(), torrent.getClientId()));
+    }
+
+    @Override
+    protected void handshakeCompleted()
+    {
 
         // the 1st message must be bitfield, but only
         // in case if we have at least one block
@@ -544,7 +581,9 @@ class StdPeerConnection extends PeerConnection
         // enqueued and that have been already sent to the remote peer
         Stream.concat(sendQueue.stream(), blockRequests.stream())
                 .filter(pm -> pm.type == StdPeerMessage.REQUEST)
-                .forEach(pm -> torrent.cancelBlockRequest(pm.index, pm.begin));
+                .forEach(pm -> {
+                    torrent.cancelBlockRequest(pm.index, pm.begin);
+                });
 
         // release messages
         sendQueue.forEach( pmCache::release);
@@ -552,9 +591,16 @@ class StdPeerConnection extends PeerConnection
         // and active requests
         blockRequests.forEach( pmCache::release);
         blockRequests.clear();
+        // peerRequests
+        peerBlockRequests.forEach( pmCache::release);
+        peerBlockRequests.clear();
 
         peer.setConnectionClosed(reason);
-        torrent.onPeerDisconnect(this);
+
+        // incoming connections could be not linked yet
+        if (torrent != null) {
+            torrent.onPeerDisconnect(this);
+        }
 
         // todo: release caches via connectionFactory
     }
@@ -562,26 +608,37 @@ class StdPeerConnection extends PeerConnection
     @Override
     protected int processReceiveBuffer(ByteBuffer rb)
     {
+        if (!handshaked)
+        {
+            // let base class to perform handshake
+            int missingBytes = super.processReceiveBuffer(rb);
+            if (missingBytes != 0) {
+                // not enough data to parse handshake,
+                // repeat later
+                return missingBytes;
+            }
+        }
+
         // we have buffer in the following state:
         // .position - start of the data in the buffer
         // .limit    - end of  --""--
 
         // handshake is the first message of the std protocol
-        if (!handshaked) {
-            // still waiting for handshake, check if we have enough data
-            if (rb.remaining() < MSG_HANDSHAKE_LENGTH) {
-                // wait for the next turn, we (must) have enough space
-                // in the buffer for the rest of this handshake (config issue)
-                return MSG_HANDSHAKE_LENGTH - rb.remaining();
-            } else {
-                // enough data, parse handshake
-                boolean correct = StdPeerProtocol.processHandshake(this, rb);
-                if (!correct) {
-                    if (DEBUG) System.out.println(peer.address + " error parsing handshake [5]");
-                    return -1;
-                }
-            }
-        }
+//        if (!handshaked) {
+//            // still waiting for handshake, check if we have enough data
+//            if (rb.remaining() < MSG_HANDSHAKE_LENGTH) {
+//                // wait for the next turn, we (must) have enough space
+//                // in the buffer for the rest of this handshake (config issue)
+//                return MSG_HANDSHAKE_LENGTH - rb.remaining();
+//            } else {
+//                // enough data, parse handshake
+//                boolean correct = StdPeerProtocol.processHandshake(this, rb);
+//                if (!correct) {
+//                    if (DEBUG) System.out.println(peer.address + " error parsing handshake [5]");
+//                    return -1;
+//                }
+//            }
+//        }
 
         // parse messages in the buffer
         while (true)
@@ -646,13 +703,25 @@ class StdPeerConnection extends PeerConnection
     @Override
     protected boolean populateSendBuffer(ByteBuffer sb)
     {
+        if (!handshaked) {
+            if (!super.populateSendBuffer(sb)) {
+                return true;
+            }
+        }
+
+//        sendQueue.forEach(x -> System.out.println("[stdpc] populate  -e>" + System.identityHashCode(x) +
+//                "     " +x.type + "  ,"  + x.index +"," + x.begin + "," + x.length) );
+
+        // count number of processed messages
         int processed = 0;
         for (StdPeerMessage message: sendQueue)
         {
+//            System.out.println("[stdpc] populate: ->>" + System.identityHashCode(message) +
+//                    "     " + message.type + ","  + message.index +"," + message.begin + "," + message.length);
             boolean populated = StdPeerProtocol.populate(this, sendBuffer, message);
             if (!populated) {
-                // indicate we have more data
-                return true;
+                // stop at this message
+                break;
             }
 
             // count processed messages
@@ -663,6 +732,8 @@ class StdPeerConnection extends PeerConnection
                 // track active block requests from our side,
                 // need to maintain max number of simultaneous requests
                 message.timestamp = System.currentTimeMillis();
+//                System.out.println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX  " +
+//                        System.identityHashCode(message) + "     " + message.type + ","  + message.index +"," + message.begin + "," + message.length);
                 blockRequests.add(message);
             }
             else if (message.type == StdPeerMessage.PIECE) {
@@ -698,11 +769,16 @@ class StdPeerConnection extends PeerConnection
             }
         }
 
-        // here index points to last processed message
+        // here processed contains number of serialized messages,
+        // bulk remove them
         sendQueue.subList(0, processed).clear();
 
-        // all message were rendered into buffer
-        return false;
+
+//        sendQueue.forEach(x -> System.out.println("[stdpc] populate  -x<" + System.identityHashCode(x) +
+//                "     " +x.type + "  ,"  + x.index +"," + x.begin + "," + x.length) );
+
+        // indicate if we have more data ready to be sent
+        return !sendQueue.isEmpty();
     }
 
 
@@ -712,20 +788,20 @@ class StdPeerConnection extends PeerConnection
      */
     void onKeepAlive() {}
 
-    /**
-     * called after receiving of handshake message from the peer
-     * @param reserved reserved bytes
-     * @param torrent torrent hash identifier
-     * @param peerId peer identifier
-     */
-    void onHandshake(byte[] reserved, HashId torrent, HashId peerId)
-    {
-        timeHandshaked = System.currentTimeMillis();
-        handshaked = true;
-
-        peer.peerId = peerId;
-        peer.reserved = reserved;
-    }
+//    /**
+//     * called after receiving of handshake message from the peer
+//     * @param reserved reserved bytes
+//     * @param torrent torrent hash identifier
+//     * @param peerId peer identifier
+//     */
+//    void onHandshake(byte[] reserved, HashId torrent, HashId peerId)
+//    {
+//        timeHandshaked = System.currentTimeMillis();
+//        handshaked = true;
+//
+//        peer.peerId = peerId;
+//        peer.reserved = reserved;
+//    }
 
     /**
      * called on PORT message receive, usually right after the BITFIELD message
@@ -744,6 +820,11 @@ class StdPeerConnection extends PeerConnection
      */
     void onRequest(int index, int begin, int length)
     {
+        if (DEBUG) System.out.println("[stdpc] onRequest:" + index + "," + begin + "," + length);
+
+//        sendQueue.forEach(pm -> System.out.println("[stdpc] onRequest  -b>" + System.identityHashCode(pm) +
+//                "     " +pm.type + "  ,"  + pm.index +"," + pm.begin + "," + pm.length) );
+
         // validate common block parameters
         boolean correct = torrent.validateBlock(index, begin, length);
         if (!correct) {
@@ -760,7 +841,11 @@ class StdPeerConnection extends PeerConnection
         peerBlockRequests.add(pm);
 
         // notify torrent to read and enqueue block
-        torrent.onRequest(this,  index, begin, length);
+        torrent.onRequest(this, index, begin, length);
+
+//        sendQueue.forEach(x -> System.out.println("[stdpc] onRequest  -a<" + System.identityHashCode(x) +
+//                "     " +x.type + "  ,"  + x.index +"," + x.begin + "," + x.length) );
+
     }
 
     /**

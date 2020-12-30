@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -15,9 +16,31 @@ import java.util.stream.Collectors;
 /**
  * Torrents meta information as usually read from .torrent files
  */
-public class Metainfo {
+public class Metainfo
+{
     /**
-     * raw parsed metainfo  data as dictionary
+     * digest size in bytes for internal validations
+     */
+    static final int DIGEST_SHA1_LENGTH = 20;
+
+    /**
+     * information about a file in meta info
+     */
+    public static class FileInfo {
+        // length of file in bytes
+        public long length;
+        // path elements
+        public List<String> names;
+
+        public FileInfo(long length, List<String> names) {
+            this.length = length;
+            this.names = names;
+        }
+    }
+
+
+    /**
+     * raw parsed meta info data as dictionary
      */
     private BEValue data;
 
@@ -40,6 +63,11 @@ public class Metainfo {
      * calculated from length and pieceLength
      */
     public final long pieces;
+    /**
+     * SHA1 hashes of all the pieces,
+     * size must be DIGEST_SHA1_LENGTH * pieces
+     */
+    public final byte[] hashes;
 
     /**
      * urls from announce-list if present
@@ -52,21 +80,6 @@ public class Metainfo {
      * of the root directory (suggestion)
      */
     public final String directory;
-
-    /**
-     * information about all files in metainfo
-     */
-    public static class FileInfo {
-        // length of file in bytes
-        public long length;
-        // path elements
-        public List<String> names;
-
-        public FileInfo(long length, List<String> names) {
-            this.length = length;
-            this.names = names;
-        }
-    }
 
     /**
      * list of files in metainfo
@@ -90,7 +103,7 @@ public class Metainfo {
                 digest.update(buffer.get(start++));
             } while (start < end);
         } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("SHA-1 is not available, can't work without it", e);
+            throw new RuntimeException("SHA-1 is not available", e);
         }
 
         return digest.digest();
@@ -106,6 +119,7 @@ public class Metainfo {
         public long length;
         public long pieceLength;
         public long pieces;
+        public byte[] hashes;
         public List<List<String>> trackers = new ArrayList<>();
         public String directory;
         public List<Metainfo.FileInfo> files = new ArrayList<>();
@@ -133,6 +147,7 @@ public class Metainfo {
         length = x.length;
         pieceLength = x.pieceLength;
         pieces = x.pieces;
+        hashes = x.hashes;
         directory = x.directory;
         files.addAll(x.files);
         trackers.addAll(x.trackers);
@@ -154,17 +169,62 @@ public class Metainfo {
      * checks meta information to be correct
      * @return true if ok
      */
-    public boolean validate() {
+    public boolean validate()
+    {
         if (length <= 0) {
             return false;
         }
         if ((pieceLength <= 0) || (length < pieceLength)) {
             return false;
         }
-
+        if (pieces < 1) {
+            return false;
+        }
+        if ((hashes == null) || (hashes.length != DIGEST_SHA1_LENGTH * pieces)) {
+            return false;
+        }
         //todo: validate all
 
         return true;
+    }
+
+    /**
+     * @param piece piece index
+     * @return true if specified piece is the last
+     */
+    public boolean isLastPiece(int piece) {
+        return piece == pieces - 1;
+    }
+
+    /**
+     * @param piece piece index
+     * @return length of the piece specified in bytes, calculates size of the last piece
+     */
+    public long pieceLength(int piece)
+    {
+        if (piece < pieces - 1) {
+            return pieceLength;
+        }
+        if (piece == pieces - 1) {
+            return length % pieceLength;
+        }
+        return 0;
+    }
+
+    /**
+     * validates hash of specified piece to be equal to the specified hash
+     * @param piece piece to validate
+     * @param hash hash to compare
+     * @return true if equals
+     */
+    public boolean checkPieceHash(int piece, byte[] hash)
+    {
+        if ((pieces <= piece) || (hash.length != DIGEST_SHA1_LENGTH)) {
+            return false;
+        }
+
+        return Arrays.equals(hashes, DIGEST_SHA1_LENGTH * piece, DIGEST_SHA1_LENGTH * piece + DIGEST_SHA1_LENGTH,
+                hash, 0, DIGEST_SHA1_LENGTH);
     }
 
 
@@ -173,7 +233,7 @@ public class Metainfo {
      * @param path path with dots as separators
      * @return value of null if not found
      */
-    private BEValue getValue(String path) {
+    protected BEValue getValue(String path) {
         String[] split = path.split("\\.");
         BEValue dict = data;
         for (int i = 0; i < split.length; i++) {
@@ -227,6 +287,11 @@ public class Metainfo {
 
         if (0 < temp.pieceLength) {
             temp.pieces = (temp.length + temp.pieceLength - 1) / temp.pieceLength;
+        }
+
+        value = getValue("info.pieces");
+        if (BEValue.isBStringWithLength(value, 20 * (int)temp.pieces)) {
+            temp.hashes = value.bString;
         }
 
         value = getValue("announce-list");

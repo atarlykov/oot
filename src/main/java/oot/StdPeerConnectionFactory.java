@@ -1,13 +1,16 @@
 package oot;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
 
 /**
- * must bu refactored to generic factory
+ * Factory to create standard peer connections
  */
-class StdPeerConnectionFactory {
+class StdPeerConnectionFactory extends PeerConnectionFactory {
 
     /**
      * must be refactored in generic/std way
@@ -71,18 +74,44 @@ class StdPeerConnectionFactory {
 
     StdPeerMessageCache pmCache = new StdPeerMessageCache();
 
+    /**
+     * @param _selector selector
+     * @param _tProvider torrent provider
+     */
+    public StdPeerConnectionFactory(Selector _selector, StdHandshakePeerConnection.TorrentProvider _tProvider) {
+        super(_selector, _tProvider);
+    }
 
-    StdPeerConnection openConnection(Selector _selector, Torrent _torrent, Peer _peer)
+    @Override
+    public SelectionKey acceptConnection(
+            SocketChannel channel, Peer peer)
+            throws IOException
     {
         ByteBuffer recvBuffer = StdPeerConnectionBufferCache.getReceiveBuffer();
         ByteBuffer sendBuffer = StdPeerConnectionBufferCache.getSendBuffer();
-        return new StdPeerConnection(_selector, _torrent, _peer,
+
+        StdPeerConnection pc = new StdPeerConnection(selector, channel, peer,
                 recvBuffer, RECV_BUFFER_NORMAL_LIMIT, RECV_BUFFER_COMPACT_LIMIT,
                 sendBuffer, SEND_BUFFER_NORMAL_LIMIT, SEND_BUFFER_COMPACT_LIMIT,
-                pmCache);
+                pmCache, torrentProvider);
+
+        return pc.accept();
     }
 
-    void closeConnection(PeerConnection pc) {
+
+    @Override
+    public PeerConnection openConnection(Peer peer, Torrent torrent)
+    {
+        ByteBuffer recvBuffer = StdPeerConnectionBufferCache.getReceiveBuffer();
+        ByteBuffer sendBuffer = StdPeerConnectionBufferCache.getSendBuffer();
+        return new StdPeerConnection(selector, torrent, peer,
+                recvBuffer, RECV_BUFFER_NORMAL_LIMIT, RECV_BUFFER_COMPACT_LIMIT,
+                sendBuffer, SEND_BUFFER_NORMAL_LIMIT, SEND_BUFFER_COMPACT_LIMIT,
+                pmCache, torrentProvider);
+    }
+
+    @Override
+    public void closeConnection(PeerConnection pc) {
         if (pc instanceof StdPeerConnection) {
             // release buffers
         }

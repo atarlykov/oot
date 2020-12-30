@@ -8,11 +8,13 @@ import oot.tracker.*;
 import java.io.Serializable;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.Selector;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 public class Torrent
 {
@@ -28,46 +30,37 @@ public class Torrent
     final ReentrantLock runnerLock = new ReentrantLock();
 
     /**
-     * internal states of each torrent
-     *
-     * UNKNOWN --> INITIALIZING --> [DOWNLOADING | SEEDING] --> STOPPING --> STOPPED
-     *                                    |           ^
-     *                                    +-----------+
+     * internal states of the torrent
      */
     enum State {
         /**
-         * state is unknown, usually after creation of a new torrent,
+         * new torrent, usually after creation of a new torrent,
          * must to load state, checks files, bind file channels, etc.
          */
-        UNKNOWN,
+        NEW,
         /**
-         * initialization is in progress, querying trackers, binding to files,
-         * checking state, etc.
+         * torrent is active and serves connections,
+         * could be in seed/download modes,
+         * behavior is controlled by a strategy
          */
-        INITIALIZING,
+        ACTIVE,
         /**
-         * torrent is downloading etc.
-         */
-        DOWNLOADING,
-        /**
-         * separate state
-         */
-        SEEDING,
-        /**
-         * waiting for all active requests to finish,
-         * then will switch to STOPPED
-         */
-        STOPPING,
-        /**
-         * bound to files, all information is known, could updated with
-         * new peers from dht, etc.
-         * connections to peers are closed.
+         * torrent is stopped and doesn't perform any upload/download,
+         * drops outgoing requests, doesn't accept new peer requests,
+         * then closes all connections,
+         * may move storage to unknown state
          */
         STOPPED,
         /**
          * something is wrong
          */
         ERROR,
+        /**
+         * dummy state used to wait for some other action to finish
+         * and set the state,
+         * todo: usually controlled with a timeout. moving to ERROR state after it
+         */
+        WAIT
     }
 
     /**
@@ -117,10 +110,10 @@ public class Torrent
     }
 
     /**
-     * connections factory
-     * todo: refactor to generic way, upgradable, etc.
+     * connections factory to be used to open new connections
+     * todo: move to strategy
      */
-    StdPeerConnectionFactory pcFactory = new StdPeerConnectionFactory();
+    PeerConnectionFactory pcFactory;
 
 
     /**
@@ -163,7 +156,11 @@ public class Torrent
     /**
      * ref to id of the parent client that controls all the torrents
      */
-    HashId clientId;
+    //final HashId clientId;
+    /**
+     * ref to the controlling client
+     */
+    final Client client;
 
     /**
      * metainfo of the torrent, parsed ".torrent" file
@@ -239,9 +236,6 @@ public class Torrent
      */
     public AtomicLong uploaded = new AtomicLong();
 
-
-
-
     /**
      * status of all pieces being downloaded,
      * Map<piece index, status>
@@ -272,6 +266,8 @@ public class Torrent
      * mem barrier after data download?
      *
      * todo: must check on new new torrent/load state/files check
+     *
+     * todo: 2 flags is the overkill
      */
     volatile boolean finished;
 
@@ -291,47 +287,46 @@ public class Torrent
 
 
     /**
-     * *ref* to the selector used, hardly coupled with a threading model.
-     * Could be a separate selector per torrent to simplify distribution of torrents
-     * between thread.
-     * Always passed from the calling party, this is not a torrent's responsibility.
-     */
-    private Selector selector;
-
-    /**
      * service queue with parameters of blocks written to storage,
      * used to separate main processing thread and callback running in a storage thread
      */
-    private final ArrayDeque<TorrentStorage.Block> written = new ArrayDeque<>(256);
+    protected final ArrayDeque<TorrentStorage.Block> written = new ArrayDeque<>(256);
 
     /**
      * service queue with parameters of blocks read from storage,
      * used to separate main processing thread and callback running in a storage thread
      */
-    private final ArrayDeque<TorrentStorage.Block> read = new ArrayDeque<>(256);
+    protected final ArrayDeque<TorrentStorage.Block> read = new ArrayDeque<>(256);
 
     /**
      * service queue to run commands/callback inside the processing thread,
      * commands are triggered by {@link #update()} call from a thread runner class,
      * mostly should be used for commands without strong latency requirements
      */
-    private final ArrayDeque<TorrentCommand> commands = new ArrayDeque<>(256);
+    protected final ArrayDeque<TorrentCommand> commands = new ArrayDeque<>(256);
+
+    /**
+     * public api to work with the torrent,
+     * could be used internally as a convenient choice
+     */
+    protected final Api api = new Api();
 
     /**
      * allowed constructor
-     * @param _clientId client id that handles torrents
+     * @param _client client id that handles torrents
      * @param _metainfo meta info of the torrent
+     * @param _pcFactory factory to open new connections
      */
-    private Torrent(HashId _clientId, Metainfo _metainfo, Selector _selector)
+    protected Torrent(Client _client, Metainfo _metainfo, PeerConnectionFactory _pcFactory)
     {
-        clientId = _clientId;
+        client = _client;
         metainfo = _metainfo;
-        selector = _selector;
+        pcFactory = _pcFactory;
 
         pieceBlocks = (int)(metainfo.pieceLength >> BLOCK_LENGTH_BITS);
         pieces = new BitSet((int)metainfo.pieces);
 
-        state = Torrent.State.UNKNOWN;
+        setState(Torrent.State.NEW);
     }
 
     /**
@@ -340,8 +335,8 @@ public class Torrent
      * @param _metainfo meta info of the torrent
      * @param _storage storage to be used to read/write torrent data
      */
-    public Torrent(HashId _client, Metainfo _metainfo, Selector _selector, TorrentStorage _storage) {
-        this(_client, _metainfo, _selector);
+    protected Torrent(Client _client, Metainfo _metainfo, PeerConnectionFactory _pcFactory, TorrentStorage _storage) {
+        this(_client, _metainfo, _pcFactory);
         storage = _storage;
     }
 
@@ -359,8 +354,18 @@ public class Torrent
         return false;
     }
 
+    /**
+     * sets new state of this torrent
+     * @param _state new state
+     */
+    protected void setState(State _state) {
+        state = _state;
+        // notify client about state change
+        client.torrentStateChanged(this, _state);
+    }
+
     public HashId getClientId() {
-        return clientId;
+        return client.id;
     }
 
     /**
@@ -473,7 +478,10 @@ public class Torrent
      * @param piece piece index
      * @param block block index
      */
-    private void markBlockCancelled(int piece, int block) {
+    private void markBlockCancelled(int piece, int block)
+    {
+        System.out.println("[torrent] markBC: " + piece + "  " + block);
+
         Torrent.PieceBlocks pb = piecesActive.get(piece);
         if (pb != null) {
             System.out.println("-X- " + piece + "  " + block + "   E:  r:" + pb.ready.get(block) + " a:" + pb.active.get(block));
@@ -875,43 +883,14 @@ public class Torrent
             // remove error state as it's possible we are going to reconnect
             peer.resetConnectionClosed();
 
-            // todo: make factory,strategy, think about upgrading connection to specific protocol??
-            PeerConnection pc = pcFactory.openConnection(selector, this, peer);
+            // todo: strategy, think about upgrading connection to specific protocol??
+            PeerConnection pc = pcFactory.openConnection(peer, this);
             connections.put(peer, pc);
             setDownloadSpeedLimit(speedLimitDownload);
             break;
         }
     }
 
-
-    /**
-     * external api method to add new peers to the torrent
-     * @param newPeers collection of peers
-     */
-    public void addPeers(Collection<Peer> newPeers) {
-        if (newPeers == null) {
-            return;
-        }
-        synchronized (peersSyncAdd) {
-            peersSyncAdd.addAll(newPeers);
-        }
-    }
-
-    /**
-     * external api method to add new peers to the torrent
-     * @param newPeers collection of peers' addresses
-     */
-    public void addPeersFromAddresses(Collection<InetSocketAddress> newPeers) {
-        if (newPeers == null) {
-            return;
-        }
-        synchronized (peersSyncAdd) {
-            for (InetSocketAddress isa: newPeers) {
-                Peer peer = new Peer(isa);
-                peersSyncAdd.add(peer);
-            }
-        }
-    }
 
     /**
      * internal method to be called on the thread that processes the torrent,
@@ -924,14 +903,6 @@ public class Torrent
             peersSyncAdd.clear();
         }
     }
-
-    /**
-     * could be called asynchronously from
-     * some storage thread
-     */
-    void onStorageError() {
-    }
-
 
     /**
      * called when last
@@ -966,11 +937,13 @@ public class Torrent
      */
     protected void onPiece(PeerConnection pc, ByteBuffer buffer, int index, int begin, int length)
     {
-        if (DEBUG) System.out.println(System.nanoTime() + "  [onPiece] " + index + "  " + (begin >> 14));
+        if (DEBUG) System.out.println(System.nanoTime() + "  [onPiece] " + index + "  " + (begin >> 14) + "      " + begin + "," + length);
+
+        System.out.println(System.nanoTime() + "  [onPiece] " + index + "  " + (begin >> 14) + "      " + begin + "," + length);
+
         storage.write(buffer, index, begin, length, (block) -> {
             if (block == null) {
                 // todo: new instance of lambda is possible here, --> make inner class ?
-                // todo: error saving block
                 if (DEBUG) System.out.println("torrent.onPiece: null block received");
             } else {
                 synchronized (written) {
@@ -1024,11 +997,37 @@ public class Torrent
             TorrentStorage.Block block;
             while ((block = read.poll()) != null) {
                 PeerConnection pc = (PeerConnection)block.param;
-                // connection will need to call release() on the block
-                pc.enqueuePiece(block.buffer, block.index, block.position, block.index, block);
-                uploaded.addAndGet(Torrent.BLOCK_LENGTH);
+
+                if (connections.containsKey(pc.peer)) {
+                    // connection will need to call release() on the block
+                    pc.enqueuePiece(block.buffer, block.index, block.position, block.length, block);
+
+                    System.out.println("[torrent] onRPRB " + block.index +","+ block.position +","+ block.length +
+                            "  [0]:" + block.buffer.get(0) + "   " + block.buffer);
+                    uploaded.addAndGet(block.length);
+                } else {
+                    // forget about block
+                    block.release();
+                }
             }
         }
+    }
+
+    /**
+     * called by active @{@link PeerConnection} to get possible ready to be sent messages,
+     * that could be asynchronously finished read requests (PIECE, REQUEST) that must
+     * be delivered to connections' queues
+     *
+     * @param pc peer connection that performs the call
+     */
+    protected void onConnectionReadyToSend(PeerConnection pc)
+    {
+        // process async responses from the storage,
+        // this marks downloaded and stored blocks
+        onPieceProcessWrittenBlocks();
+        // this enqueues pieces received from the storage
+        // to be send over a connection (also called before send)
+        onRequestProcessReadBlocks();
     }
 
     /**
@@ -1151,95 +1150,6 @@ public class Torrent
         }
     }
 
-
-    /**
-     * dumps active connections of the torrent to stdout
-     */
-    public void dump()
-    {
-        Formatter formatter = new Formatter();
-        formatter.format("torrent: %s\n", metainfo.infohash.toString());
-        formatter.format("                              L  P                                 \n");
-        formatter.format("                          C H CI CI   DLR  RQ   BLKS |   UPL  Q   BLKS     %%\n");
-
-        connections.values().forEach(pc -> pc.dump(formatter));
-
-//        formatter.format(" peer messages created: %d\n", PeerMessageCache.counter);
-//        formatter.format("     buffers allocated: %d\n", SimpleFileStorage.buffersAllocated);
-        formatter.format("                 state: %s\n", state.name());
-        formatter.format("            completion: %.2f\n", 100.0 * pieces.cardinality() / metainfo.pieces);
-        formatter.format("                 peers: %d\n", peers.size());
-        //formatter.format("       save task queue: %d\n", SimpleFileStorage.exSave.getQueue().size());
-
-        System.out.println(formatter.toString());
-    }
-
-    /**
-     * this method is called periodically by client to update state,
-     * open/close new connections, send keep alive messages,
-     * perform some maintenance, etc.
-     */
-    protected void update()
-    {
-
-        System.out.println(" *** [ TUPDATE ] *** ");
-        
-        long now = System.currentTimeMillis();
-        timeLastUpdate = now;
-
-        if ((state == Torrent.State.DOWNLOADING) || (state == State.SEEDING))
-        {
-            updateConnections();
-
-            // try to get more peers, methods must check timeout
-            trackers.forEach(tracker -> tracker.updateIfReady( (success, ps) -> {
-                if (success) {
-                    addPeersFromAddresses(ps);
-                }
-            }));
-
-            // todo re-announce?
-
-            if (!completed && (TORRENT_STATE_SAVE_TIMEOUT < timeLastUpdate - timeLastStateSave)) {
-                writeState();
-                timeLastStateSave = timeLastUpdate;
-            }
-        }
-
-        if (state == Torrent.State.STOPPING) {
-            // ?timeout?
-            boolean stopped = true;
-            for (Map.Entry<Peer, PeerConnection> entry: connections.entrySet()) {
-                PeerConnection pc = entry.getValue();
-                if (!pc.isDownloading()) {
-                    pc.close(Peer.CloseReason.NORMAL);
-                } else {
-                    stopped = false;
-                    break;
-                }
-            }
-            if (stopped) {
-                // force close & remove connections
-                connections.values().forEach(pc -> pc.close(Peer.CloseReason.NORMAL));
-                connections.keySet().removeIf(Peer::isConnectionClosed);
-
-                // notify trackers
-                trackers.forEach( Tracker::stopped );
-
-                state = Torrent.State.STOPPED;
-            }
-        }
-
-        // todo: move to states ?
-        onPieceProcessWrittenBlocks();
-        onRequestProcessReadBlocks();
-
-        processCommandQueue();
-
-        // merge peers collections
-        moveNewPeersToMainCollection();
-    }
-
     /**
      * initiates save store via the associated storage api,
      * must be called only from a runner thread or via cmd
@@ -1252,7 +1162,8 @@ public class Torrent
     }
 
     /**
-     * restores state loading it from the storage
+     * restores state loading it from the storage,
+     *
      * @param callback callback to be notified with true if state was successfully restored and
      *                 false if it's missing or there were some errors
      */
@@ -1263,7 +1174,7 @@ public class Torrent
 
         storage.readState(piecesClone, piecesActiveClone, result -> {
             // this could be called on storage thread
-            addCommand(() -> {
+            addCommand((torrent) -> {
                 // this is called in runner thread
                 if (result) {
                     pieces.clear();
@@ -1285,12 +1196,15 @@ public class Torrent
      */
     protected void processCommandQueue()
     {
-        synchronized (commands) {
-            TorrentCommand fun;
-            while ((fun = commands.poll()) != null) {
-                fun.execute();
+        TorrentCommand fun;
+        do {
+            synchronized (commands) {
+                fun = commands.poll();
             }
-        }
+            if (fun != null) {
+                fun.execute(this);
+            }
+        } while (fun != null);
     }
 
     /**
@@ -1311,42 +1225,377 @@ public class Torrent
      * must be called only from a runner thread via sending
      * command to this torrent via public api
      */
-    protected void cmdStart()
+    protected void start()
     {
         State _state = state;
 
-        if (_state == State.UNKNOWN)
-        {
-            state = State.INITIALIZING;
-            readState(result -> {
-                if (result) {
-                    if (completed) {
-                        state = State.SEEDING;
-                    } else {
-                        state = Torrent.State.DOWNLOADING;
-                    }
-                }
-                else {
-                    // no state available
-                    storage.init((initialized) -> addCommand(() -> {
-                        // this is called in runner thread
-                        if (!initialized) {
-                            state = Torrent.State.ERROR;
-                        } else {
-                            state = Torrent.State.DOWNLOADING;
-                        }
-                    }));
-                }
-            });
+        if (_state == State.ACTIVE) {
+            // already started
+            return;
         }
-        else if (_state == State.STOPPED) {
-            if (isFinished()) {
-                state = State.SEEDING;
-            } else {
-                state = State.DOWNLOADING;
+
+        ////////////////////////////////////////////////////////////////////
+        if ((_state == State.NEW) || (_state == State.STOPPED))
+        {
+            TorrentStorage.State tsState = storage.getState();
+            if (tsState == TorrentStorage.State.UNKNOWN) {
+                // ok, check if we have any state for the torrent
+                readState(success ->
+                {
+                    // this will run in torrent thread,
+                    // due to method contract this will happen only once
+                    // as storage mode will be changes on exit
+                    storage.bind(!success, true, false, null);
+                });
+                // ACTIVE will wait for storage to be BOUND|ERROR
+                setState(State.ACTIVE);
             }
+            else if (tsState == TorrentStorage.State.ERROR) {
+                // that is strange, new torrent with incorrect storage,
+                // switch to error state
+                setState(State.ERROR);
+            }
+            else if (tsState == TorrentStorage.State.BOUND) {
+                // switch to ACTIVE state, it will handle
+                // possible storage errors
+                setState(State.ACTIVE);
+            }
+            else {
+                // all other storage states are intermediate,
+                // we are not interested in them... try to run in ACTIVE,
+                // it will handle errors
+                setState(State.ACTIVE);
+            }
+
+            return;
+        }
+
+        ////////////////////////////////////////////////////////////////////
+        if (_state == State.ERROR)
+        {
+            TorrentStorage.State tsState = storage.getState();
+            if (tsState == TorrentStorage.State.BOUND) {
+                // strange, just try to run
+                setState(State.ACTIVE);
+            }
+            else if (tsState == TorrentStorage.State.UNKNOWN)
+            {
+                // that should not happen, handle as NEW/UNKNOWN
+                readState(success ->
+                {
+                    // this will run in torrent thread,
+                    // due to method contract this will happen only once
+                    // as storage mode will be changes on exit
+                    storage.bind(!success, true, false, null);
+                });
+                // try to run it
+                setState(State.ACTIVE);
+            }
+            else if (tsState == TorrentStorage.State.ERROR)
+            {
+                TorrentStorage.ErrorDetails eDetails = storage.getErrorStateDetails();
+                boolean recheck = (eDetails != null) && (eDetails.type == TorrentStorage.ErrorType.INTEGRITY);
+                storage.bind(false, false, true, (sState, bitSet) -> {
+                    if (sState == TorrentStorage.State.BOUND) {
+                        pieces.clear();
+                        pieces.or(bitSet);
+                    }
+                });
+
+                // update() will wait for storage reply
+                setState(State.ACTIVE);
+            }
+            return;
         }
     }
+
+    protected void stop() {
+
+    }
+
+    /**
+     * this method is called periodically by client to update state,
+     * open/close new connections, send keep alive messages,
+     * perform some maintenance, etc.
+     */
+    protected void update()
+    {
+        timeLastUpdate = System.currentTimeMillis();
+
+        // todo: move to states ?
+        // todo: call after receive/send
+
+        // process async responses from the storage,
+        // this marks downloaded and stored blocks
+        onPieceProcessWrittenBlocks();
+        // this enqueues pieces received from the storage
+        // to be send over a connection (also called before send)
+        onRequestProcessReadBlocks();
+
+        // process externally submitted commands that
+        // must be executed in runner thread
+        processCommandQueue();
+
+        // merge peers collections
+        moveNewPeersToMainCollection();
+
+        // state specific logic
+        switch (state) {
+            case NEW -> updateInNewState();
+            case ACTIVE -> updateInActiveState();
+            case STOPPED -> updateInStoppedState();
+            default -> {}
+        }
+
+    }
+
+    protected void updateInNewState()
+    {
+        // do nothing for now
+    }
+
+    protected void updateInActiveState()
+    {
+        TorrentStorage.State tsState = storage.getState();
+        if (tsState == TorrentStorage.State.ERROR) {
+            // something went wrong during the processing,
+            // stop torrent
+            setState(State.ERROR);
+            return;
+        }
+
+        if (tsState != TorrentStorage.State.BOUND) {
+            // wait till storage is ready,
+            // must not often happen here, just another protection,
+            // nut could be used when switching to this state
+            return;
+        }
+
+        // main logic is there, it handles seed/download modes
+        updateConnections();
+
+        // try to get more peers, this checks timeout inside for each tracker
+        trackers.forEach(tracker -> tracker.updateIfReady( (success, ps) -> {
+            if (success) {
+                api.addPeersFromAddresses(ps);
+            }
+        }));
+
+        // todo re-announce?
+
+        if (!completed && (TORRENT_STATE_SAVE_TIMEOUT < timeLastUpdate - timeLastStateSave)) {
+            writeState();
+            timeLastStateSave = timeLastUpdate;
+        }
+    }
+
+    protected void updateInStoppedState()
+    {
+        // ?timeout?
+        boolean stopped = true;
+        for (Map.Entry<Peer, PeerConnection> entry: connections.entrySet()) {
+            PeerConnection pc = entry.getValue();
+            if (!pc.isDownloading()) {
+                pc.close(Peer.CloseReason.NORMAL);
+            } else {
+                stopped = false;
+                break;
+            }
+        }
+        if (stopped) {
+            // force close & remove connections
+            connections.values().forEach(pc -> pc.close(Peer.CloseReason.NORMAL));
+            connections.keySet().removeIf(Peer::isConnectionClosed);
+
+            // notify trackers
+            trackers.forEach( Tracker::stopped );
+
+            setState(Torrent.State.STOPPED);
+        }
+    }
+
+    /**
+     * public API to work with a torrent
+     */
+    public class Api {
+        /**
+         * schedules "torrent::start" command to be run in a runner thread
+         * @return future that will be completed on operation finish,
+         * it will be completed with "true" only if torrent has been switched to ACTIVE state,
+         * but it could have been moved to some intermediate state and will switch to ACTIVE later
+         */
+        public CompletableFuture<Boolean> start()
+        {
+            CompletableFuture<Boolean> future = new CompletableFuture<>();
+            addCommand(torrent -> {
+                torrent.start();
+                future.complete(torrent.state == State.ACTIVE);
+            });
+            return future;
+        }
+
+        /**
+         * schedules "torrent::stop" command to be run in a runner thread
+         * @return future that will be completed on operation finish
+         */
+        public CompletableFuture<Void> stop()
+        {
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            addCommand(torrent -> {
+                torrent.stop();
+                future.complete(null);
+            });
+            return future;
+        }
+
+
+        /**
+         * external api method to add new peers to the torrent
+         * @param addresses collection of peers' addresses
+         */
+        public void addPeersFromAddresses(Collection<InetSocketAddress> addresses)
+        {
+            if (addresses == null) {
+                return;
+            }
+            synchronized (peersSyncAdd) {
+                for (InetSocketAddress isa: addresses) {
+                    Peer peer = new Peer(isa);
+                    peersSyncAdd.add(peer);
+                }
+            }
+        }
+
+        /**
+         * external api method to add new peers to the torrent
+         * @param newPeers collection of peers
+         */
+        public void addPeers(Collection<Peer> newPeers) {
+            if (newPeers == null) {
+                return;
+            }
+            synchronized (peersSyncAdd) {
+                peersSyncAdd.addAll(newPeers);
+            }
+        }
+
+        /**
+         * allows a function to process list of registered trackers inside the torrent
+         * @param func function to be called inside processing thread
+         * @return result of the function
+         */
+        public <R> CompletableFuture<R> trackers(Function<List<Tracker>, R> func)
+        {
+            CompletableFuture<R> future = new CompletableFuture<>();
+            addCommand(torrent -> {
+                R result = func.apply(trackers);
+                future.complete(result);
+            });
+            return future;
+        }
+
+        /**
+         * adds another tracker to the list of torrent's trackers
+         * @param tracker new tracker
+         * @return future that will be completed on operation finish
+         */
+        public CompletableFuture<Void> addTracker(Tracker tracker)
+        {
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            addCommand(torrent -> {
+                torrent.trackers.add(tracker);
+                future.complete(null);
+            });
+            return future;
+        }
+
+
+        /**
+         * adds another connection to the torrent's list of active connections,
+         * this is more like a service function, but could be used to dev/debug
+         * new connection types
+         * @param pc connection
+         */
+        public void addConnection(PeerConnection pc)
+        {
+            addCommand((x) -> connections.put(pc.peer, pc));
+        }
+
+
+        void getPieces() {}
+        void setPieces() {}
+        void setPieces(int idx) {}
+
+        void getState() {}
+        void setState() {}
+
+        void getStorageApi() {}
+        void getSState() {}
+        void getInputStream() {}
+        void getOutputStream() {}
+        void bind() {}
+
+        /**
+         * creates "torrent::writeState" command for the given torrent
+         * and places it into the commands' queue of the torrent
+         * to be executed later
+         * @param torrent torrent
+         */
+        public void cmdTorrentWriteState(Torrent torrent)
+        {
+            torrent.addCommand(Torrent::writeState);
+        }
+
+        /**
+         * creates "torrent::readState" command for the given torrent
+         * and places it into the commands' queue of the torrent
+         * to be executed later
+         * @param torrent torrent
+         */
+        public void cmdTorrentReadState(Torrent torrent, Consumer<Boolean> callback)
+        {
+            torrent.addCommand((t) -> torrent.readState(callback));
+        }
+
+        /**
+         * dumps active connections of the torrent to stdout
+         */
+        public void dump()
+        {
+            addCommand(torrent -> {
+                Formatter formatter = new Formatter();
+                formatter.format("torrent: %s\n", metainfo.infohash.toString());
+                formatter.format("                              L  P                                 \n");
+                formatter.format("                          C H CI CI   DLR  RQ   BLKS |   UPL  Q   BLKS     %%\n");
+
+                connections.values().forEach(pc -> pc.dump(formatter));
+
+//        formatter.format(" peer messages created: %d\n", PeerMessageCache.counter);
+//        formatter.format("     buffers allocated: %d\n", SimpleFileStorage.buffersAllocated);
+                formatter.format("                 state: %s\n", state.name());
+                formatter.format("            completion: %.2f\n", 100.0 * pieces.cardinality() / metainfo.pieces);
+                formatter.format("                 peers: %d\n", peers.size());
+                //formatter.format("       save task queue: %d\n", SimpleFileStorage.exSave.getQueue().size());
+
+                System.out.println(formatter.toString());
+            });
+        }
+
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 }

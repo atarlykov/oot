@@ -6,6 +6,7 @@ import oot.be.Metainfo;
 import java.nio.ByteBuffer;
 import java.util.BitSet;
 import java.util.Map;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -24,16 +25,79 @@ public abstract class TorrentStorage {
      * state of a torrent from the storage point of view
      */
     public enum State {
-        // usually this state is used on creation
-        UNKNOWN,
-        // process of space allocation is in process
-        ALLOCATING,
-        // torrent is being checked
-        CHECKING,
-        // ready for read/write
-        READY,
-        // some io error exists
-        ERROR
+        UNKNOWN,        // usually this state is used on creation
+        BINDING,        // checking if resources (files) are available and correct (size)
+        ALLOCATE,       // process of space allocation is in progress (missing parts)
+        CHECK,          // torrent is being checked piece by piece and/or creates/allocates missing part
+        BOUND,          // resource are bound, ready for read/write
+        ERROR           // some io error has occurred
+
+        /**
+         * based on Torrent.pieces state,
+         *
+         *
+         *
+         *                                        +----(sizes ok)-----------------------+
+         *                                        |                                     |
+         *                                        |                                    \|/
+         * UNKNOWN  --( torrent state ) ---> BINDING --(no files)--> ALLOCATING ----> BOUND <-+----------------+
+         *                                        |                                     |                      |
+         *                                        |                                    \|/                     |
+         *                                        +----(missing/sizes error)--------> ERROR --+-> CHECK/ALLOC -+
+         *                                                                             /|\        (tor state)
+         *                                                                              |
+         *                                                              on io error ----+
+         *  Could be in stationary states: BOUND, ERROR
+         *  other states are intermediate, client should wait.
+         *  Maybe ERROR --> ALLOCATING  --> BOUND where ALLOCATING is allocation and/or just files creation
+         *
+         *  BINDING / CHECk/ALLOC
+         *
+         *
+         *                                    +------(allocate?, )----------------------------+
+         *                                    |                                               |
+         *                                    |   +----(sizes ok)-----------------------+     |
+         *                                    |   |                                     |     |
+         *                                   \|/  |                                    \|/    |
+         * UNKNOWN  --( torrent state ) ---> BINDING --(no files)--> ALLOCATING ----> BOUND   |
+         *                                        |                                     |     |
+         *                                        |                                     |     |
+         *                  (missing/sizes error) +----- (recheck) ---- CHECK ----------+     |
+         *                   need pieces recheck  |         true       +alloc                 |
+         *                                        |                                           |
+         *                                        +---------------------------------> ERROR --+
+         *                                                                             /|\
+         *                                                                              |
+         *                                                              on io error ----+
+         *
+         *
+         *                                                          ERROR_PIECES    ERROR
+         *                                                          ERROR(piecesError, io, ..)
+         *
+         *
+         */
+    }
+
+    /**
+     * type of error when storage is in ERROR state
+     */
+    public enum ErrorType {
+        INTEGRITY,      // torrent needs pieces' check (hashes)
+        IO              // some io error occurred (message)
+    }
+
+    /**
+     * details of error when storage is in ERROR state
+     */
+    public static class ErrorDetails
+    {
+        public final ErrorType type;
+        public final String message;
+
+        public ErrorDetails(ErrorType type, String message) {
+            this.type = type;
+            this.message = message;
+        }
     }
 
     /**
@@ -79,56 +143,79 @@ public abstract class TorrentStorage {
     }
 
     /**
-     * ref to the metainfo of a torrent that is serviced with this instance
+     * ref to the meta info of a torrent that is serviced with this instance
      */
     Metainfo metainfo;
     /**
-     * state of the this TorrentStorage
+     * state of this TorrentStorage
      */
     volatile State state;
+    /**
+     * optional error details if state == {@link State#ERROR}
+     */
+    volatile ErrorDetails error;
 
     /**
      * allowed constructor
      *
      * @param metainfo meta info of the torrent
-     * @param state    initial state
      */
-    public TorrentStorage(Metainfo metainfo, State state) {
+    public TorrentStorage(Metainfo metainfo) {
         this.metainfo = metainfo;
-        this.state = state;
+        this.state = State.UNKNOWN;
     }
 
     /**
      * @return generic state of the torrent storage
      */
     public State getState() {
-        return State.UNKNOWN;
+        return state;
     }
 
     /**
-     * initializes storage to be used for reading/writing,
-     * could set READY state or leave it UNKNOWN, depends on a specific storage
+     * @return error details of present, could be null,
+     * getState() == ERROR doesn't guarantee (getErrorStateDetails() != null) as the next step
+     */
+    public ErrorDetails getErrorStateDetails() {
+        return error;
+    }
+
+    /**
+     * tries to move torrent into State.BOUND from any current state,
+     * call can be ignored if this storage is in some transition state, like:
+     *  UNKNOWN ---> BINDING ---> ... BOUND | ERROR
+     *  ERROR   ---> BINDING(allocate, piecesCheck) ---> ... BOUND | ERROR
+     *  BOUND   ---> ignored (callback will be called)
+     *  others  ---> ignored (callback could be not called)
+     *
+     * @param newTorrent torrent is new and existing files are not allowed (todo: review)
+     * @param allocate space may be allocated during subsequent ALLOCATE phase if true
+     * @param recheck run pieces recheck phase if true
+     * @param callback optional callback to be notified on finish with new state and (optionally) with
+     *                 result of pieces check
+     */
+    public abstract void bind(
+            boolean newTorrent,
+            boolean allocate, boolean recheck,
+            BiConsumer<State, BitSet> callback);
+
+    /**
+     * starts whole torrent check process, calculates and
+     * validates hashes of all the pieces against meta info data,
+     * notifies callback with a result, bitset will contain "set" bit
+     * in place of each correct piece
      *
      * @param callback callback to be notified on finish
      */
-    public abstract void init(Consumer<Boolean> callback);
+    public abstract void check(Consumer<BitSet> callback);
 
     /**
-     * todo: must find correct pieces
-     * starts check process
-     *
-     * @param callback callback to be notified on finish todo: change
+     * calculates hash of the specified piece and validates
+     * it against meta info
+     * @param piece piece index
+     * @param callback callback, true in case of piece is correct
      */
-    public abstract void check(Consumer<Boolean> callback);
-
-    /**
-     * MUST be called by a client code after any block is sent to it
-     * via callback in {@link #read(int, int, int, Object, Consumer)} method.
-     * This releases buffer for reuse... MUST be called, possible to go with WeakRef, but ...
-     *
-     * @param block block to release/unlock
-     */
-    public abstract void release(Block block);
+    public abstract void check(int piece, Consumer<Boolean> callback);
 
     /**
      * sends block of data to the storage for save operation, find correct place (file) that contains the block,
@@ -148,15 +235,14 @@ public abstract class TorrentStorage {
     public abstract void write(ByteBuffer buffer, int index, int position, int length, Consumer<Block> callback);
 
     /**
-     * requests block of data to be read into the buffers from torrent's storage (file or some other place)
-     * if block spans several files, reads from all of them.
-     * buffer's (position, limit) must match amount of data to be read (length).
-     * this TorrentStorage must be in READY state.
-     * <p>
+     * Requests block of data to be read from torrent's storage (file or some other place)
+     * into a new buffer (allocated or cached) inside Block returned.
+     * Returned buffer's position and limit ARE point to the beginning and the end of the data read.
+
+     * NOTE: This TorrentStorage must be in READY state.
      * NOTE: operation could be performed asynchronously, with callback called from other thread,
-     * buffer MUST be releases with a call to {@link #release(Block)}
-     * <p>
-     * block can't be referenced after block.release
+     * NOTE: buffer MUST be releases with a call to {@link #release(Block)}
+     * NOTE: block can't be referenced after block.release
      *
      * @param index    index of the piece
      * @param position shift in the piece
@@ -167,7 +253,19 @@ public abstract class TorrentStorage {
     public abstract void read(int index, int position, int length, Object param, Consumer<Block> callback);
 
     /**
-     * writes state of the torrent to be available later in case of restarts
+     * MUST be called by a client code after any block is sent to it
+     * via callback in {@link #read(int, int, int, Object, Consumer)} method.
+     * This releases buffer for reuse... MUST be called, possible to go with WeakRef, but ...
+     *
+     * @param block block to release/unlock
+     */
+    public abstract void release(Block block);
+
+    /**
+     * writes state of the torrent to be available later in case of restarts,
+     * it must be safe to store references inside the implementation, calling
+     * party must send copies here
+     *
      * @param pieces state of pieces
      * @param active state of blocks for pieces being downloaded
      */
@@ -175,12 +273,16 @@ public abstract class TorrentStorage {
 
     /**
      * reads state of the torrent into the specified structures
+     *
      * @param pieces will be populated with pieces state
      * @param active will be populated with active pieces state
      * @param callback callback to be notified with true if state was successfully restored and
      *                 false if it's missing or there were some errors
      */
-    public abstract void readState(BitSet pieces, Map<Integer, Torrent.PieceBlocks> active, Consumer<Boolean> callback);
+    public abstract void readState(
+            BitSet pieces,
+            /*todo: remove?*/Map<Integer, Torrent.PieceBlocks> active,
+            Consumer<Boolean> callback);
 
     /**
      * this could be used to limit number of ingoing requests and/or send choke commands

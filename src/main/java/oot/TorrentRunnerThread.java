@@ -68,7 +68,7 @@ class TorrentRunnerThread extends Thread
                         }
                         TorrentCommand command = null;
                         while ((command = commands.poll()) != null) {
-                            command.execute();
+                            command.execute(torrent);
                         }
                     } finally {
                         torrent.runnerLock.unlock();
